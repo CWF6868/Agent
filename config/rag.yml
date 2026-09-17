@@ -1,0 +1,13 @@
+# 对话模型名称（按所用服务商填写）
+#   阿里云百炼 -> qwen-max / qwen-plus
+#   DeepSeek   -> deepseek-chat
+#   OpenAI     -> gpt-4o-mini
+chat_model_name: qwen-max
+
+# Embedding 模型名称（DashScope 时使用 text-embedding-v3）
+embedding_model_name: text-embedding-v3
+
+# 大模型 API 端点地址（第三方代理 / OneAPI / NewAPI 等必须填写）
+# 官方 OpenAI 无需填写；DeepSeek 填 https://api.deepseek.com/v1
+# 留空则依次回退到环境变量 OPENAI_API_BASE / OPENAI_BASE_URL
+api_base: ""

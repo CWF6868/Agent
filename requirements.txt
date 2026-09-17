@@ -1,0 +1,32 @@
+# ============================================================
+# 扫地机器人智能客服 Agent —— Python 依赖
+# 安装：pip install -r requirements.txt
+# ============================================================
+
+# ---------- Web 界面 ----------
+streamlit>=1.30.0
+
+# ---------- LangChain 核心 ----------
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langchain-openai>=0.2.0
+langchain-text-splitters>=0.3.0
+
+# ---------- RAG / 向量库 ----------
+langchain-chroma>=0.1.4
+chromadb>=0.5.0
+
+# ---------- 文档加载 ----------
+pypdf>=4.0.0
+
+# ---------- 配置 ----------
+PyYAML>=6.0
+
+# ============================================================
+# 说明：
+# - Embedding 使用 DashScope（阿里云百炼）时，需要额外安装：
+#       pip install dashscope
+#   并设置环境变量 DASHSCOPE_API_KEY
+# - 对话模型通过 OpenAI 兼容接口调用，密钥读取环境变量 OPENAI_API_KEY
+# ============================================================
