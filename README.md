@@ -405,11 +405,12 @@ report_prompt_path: prompts/report_prompt.txt       # 报告写手提示词
 
 ## ⚠️ 注意事项
 
-1. **API Key 安全**：密钥一律通过环境变量注入，不要写入配置文件。仓库中仅保留 `config/rag.yml.example` 模板；本地真实配置请放在 `config/rag.local.yml`（已被 `.gitignore` 忽略）。
-2. **知识库首次构建**：首次运行必须执行 `python rag/vector_store.py`，否则 `rag_summarize` 检索为空。
-3. **天气工具**：依赖 `wttr.in` 公网服务，网络不通时返回兜底文案，不影响主流程。
+1. **API Key 安全**：密钥一律通过环境变量注入，不要写入配置文件。项目根目录的 `.env`（由 `.env.example` 复制而来）会在启动时自动加载，**已存在的系统环境变量优先、不会被覆盖**；同理，运行时以 `config/rag.yml` 为基线，若存在 `config/rag.local.yml` 则会覆盖同名字段，本地真实端点写在那里面即可（已被 `.gitignore` 忽略，仓库中仅保留 `config/rag.yml.example` 模板）。
+2. **知识库自动入库**：RAG 服务首次初始化时会自动把 `data/` 下的新增或已修改知识文件补进向量库（按文件 MD5 去重，已入库的文件直接跳过），**无需再手动执行** `python rag/vector_store.py`；该命令仍可用于单独预构建知识库、提前排除解析问题。
+3. **天气工具**：依赖 `wttr.in` 公网服务，网络不通时返回兜底文案，不影响主流程。降雨概率取自该接口未来 6 小时的真实预报值，取不到时该段描述会被整体省略，不会用固定文案代替。
 4. **外部数据热更新**：`data/external/records.csv` 按文件 `mtime` 判断是否需要重新加载，修改 CSV 后**无需重启进程**，下次调用自动生效。
-5. **会话缓存**：`ReactAgent` 内存中的 `sessions` 与 SQLite 双写，进程重启后从 SQLite 恢复完整历史。
+5. **会话缓存**：`ReactAgent` 内存中的 `sessions` 与 SQLite 双写，进程重启后从 SQLite 恢复完整历史。会话库启用了 WAL 模式，多会话并发读写不会互相阻塞。
+6. **报告模式退出**：用户触发报告生成后该会话进入报告模式；报告一旦产出即自动恢复普通模式，中途也可用侧边栏的「退出报告模式」手动结束。
 
 ---
 
