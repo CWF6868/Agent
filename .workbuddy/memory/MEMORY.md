@@ -22,12 +22,21 @@
    PowerShell 只在 Bash 不可用时兜底（其 stdout 不返回，需写文件再 Read）。
    同理，`.workbuddy/memory/MEMORY.md` 里"git 仓库 README.md 处于 AA 冲突"的旧结论也**已过期**：
    2026-09-25 已提交合并 `a51a2c0`。
+7. **后台启动的 streamlit 实例只活当轮**（2026-09-25 实测）。用 `run_in_background` 起服务能正常
+   工作一整个回合（HTTP 200），但本轮结束后进程即被回收（Duration 2m1s / status=failed）。
+   → 给用户的页面链接只在当轮有效；需要人工验证页面时，**把启动命令一并给出**，别假定链接还活着。
+   本机启动命令：`C:\Users\21301\AppData\Local\Programs\Python\Python311\python.exe -m streamlit run app.py --server.port 8502`
 
 ## 项目约定
 
-- 配置分层：`config/rag.yml` 是**唯一实际生效**的配置文件（内含真实 `api_base`）。
-  代码支持 `config/rag.local.yml` 覆盖同名键，但**该文件当前并不存在**（2026-09-25 核实，
-  `config/` 下只有 agent/chroma/prompts/rag 四个 yml）。密钥走环境变量或根目录 `.env`。
+- 配置分层（2026-09-25 归位，**与仓库文档/`.gitignore` 注释一致**）：
+  - `config/rag.yml` = **占位模板**（`api_base: ""`、模型名用公共示例），**被 git 跟踪**，可以随便提交；
+  - `config/rag.local.yml` = **真实私有值**（私有 MaaS 端点 + `qwen3.8-max` / `qwen3.7-text-embedding`），
+    **已被 `.gitignore` 忽略，绝不要提交**；
+  - `utils/config_handler.load_rag_config()` 先读 rag.yml 作基线，再用 rag.local.yml **浅覆盖**同名键；
+  - `config/rag.yml.example` 与 `rag.yml` 内容相同，作为模板备份保留。
+  ⚠️ 端点/自定义模型名只写在 `rag.local.yml`；工作记忆里的相关记录也已脱敏为 `ws-<workspace-id>`，
+  不要把明文写回任何被跟踪的文件。密钥走环境变量或根目录 `.env`。
 - **报告模式的唯一权威源是会话状态** `session["mode"]`（`ReactAgent.sessions`，按
   `conversation_id` 隔离），持久化为 `conversations.mode`；`get_mode()` / `_get_system_prompt()`
   一律按 `conversation_id` 读取。中间件 `_context_store` 只是按 user_id 的**进程内存镜像**，
@@ -39,6 +48,64 @@
 - 启动：`streamlit run app.py`；可选 `python middleware.py` 起中间件 HTTP 服务（127.0.0.1:8000）。
 - 本机系统环境变量已设置 `OPENAI_API_KEY` 与 `DASHSCOPE_API_KEY`（均为 DashScope 风格 key），
   因此端点必须由 `rag.yml` 的 `api_base` 提供，否则会回落到 OpenAI 官方地址导致鉴权失败。
+
+## 会话历史完整性（P2，2026-09-25 修复）
+
+**症状**：某条会话打不开/怎么问都失败，日志里是
+`OpenAIInvalidRequestError: 400 - invalid_parameter_error: The provided messages input is invalid.
+The error info is [Can only get item pairs from a mapping.]`，**每次重试都复现**。
+
+**机理**：ReAct 循环里 `AIMessage(tool_calls=[...])` 与其配对的 `ToolMessage` 若分两次落盘，
+进程在两次之间中断（崩溃 / Streamlit Stop / 强杀 / 容器被回收）就会留下"声明了工具调用、
+却没有配对 tool 响应"的历史。这种历史原样发给模型 → 400。**危险窗口 = 第一个工具的执行时长**
+（RAG 类工具动辄几十秒，窗口很大）。
+
+**两层修复**（`agent/tools/session_store.py` + `agent/react_agent.py`）：
+1. **写入原子化**：`chat()` / `chat_stream()` 改为「先把本轮全部工具执行完并收集配对响应，
+   最后把 AI 消息 + 它的全部 tool 响应一次性 append 并落盘」。工具执行期间历史末尾仍是用户消息，
+   所以任何落盘点（含 `_switch_to_report_mode` 的落盘）都是自洽的。
+2. **恢复时清洗**：`session_store.sanitize_history()`（幂等、不修改入参），在 `get_conversation()`
+   里对恢复出来的历史统一调用。规则：无配对响应的 tool_call 从声明中剔除；剔除后既无 tool_call
+   又无正文的 AI 消息整条丢弃；找不到前置声明的孤儿 tool 消息丢弃。
+   已经损坏的旧记录**读取时即自愈**，不需要一次性数据迁移。
+
+**验证脚本**：根目录 `_verify_p2.py`（A 单元 8 例 / B 真实库 25 条自愈 / C 真模型 A/B /
+D+D2 `chat` 与 `chat_stream` 双路径崩溃模拟），报告 `_p2_report.json`。
+⚠️ 项目自带的 `test_react_integration.py` / `test_session_persist.py` **完全不覆盖 `chat_stream`**，
+改流式路径必须自己补验证。
+
+## 会话状态机孤儿（P3，2026-09-25 修复）
+
+**症状**：某用户切到别的用户、或中途关掉浏览器后，之前那条会话**从历史列表里消失**，
+既看不到也清不掉，对话内容永久不可见。
+
+**机理**：`active` 与 `archived` 构成的状态机里，"当前会话"同时被 **属主(user_id)** 和
+**状态(status)** 两个条件筛选 —— `list_archived(user_id)` 只查 `status='archived'`，
+而归档动作 `archive_all_active(user_id)` 也只作用于当前用户。两者口径一致地"漏掉"
+了**属主已切走的 active**：它不是 archived（列表不显示），也不是当前用户的 active（不会被归档）。
+
+**修法**：让"同一时刻至多一条 active"成为不变量。
+- `session_store.archive_all_active(user_id=None)`：`None` 时归档**全部用户**的 active；
+  传 `user_id` 时保持原语义（`test_react_integration.py` 仍在用）。
+- `app.py::start_new_conversation` 改为无参调用（页面每次打开/切用户都会走一次）。
+- 已被遗弃的 active 会在**下次页面打开时自动收起**并出现在对应用户的历史列表里，无需迁移脚本。
+
+**代价（已知并接受）**：多浏览器场景下，B 标签页打开页面会把 A 标签页正在进行的会话一并归档。
+不丢数据（消息仍按 conversation_id 追加），只是可能提前收起。单用户演示定位下可接受。
+
+**验证脚本**：根目录 `_verify_p3.py`（A 语义 4 例 / B 旧行为 vs 新行为对照 / C app 调用点静态检查 /
+D 真实库只读体检），报告 `_p3_report.json`。
+
+## 会话库清理与备份（2026-09-25）
+
+- 已按用户确认清理：删掉 user 1001 的 117 条 archived 测试残留（id 41~163，含 25 条悬空记录），
+  保留当前 active 空会话。**保留 active 是必须的**：删掉它会让运行中的页面在
+  `save_conversation` 里 `SELECT ... WHERE id=?` 拿不到行 → 走 `return` 分支**静默丢弃消息**。
+- 清理前全量快照：`.workbuddy/backups/sessions.db.20260925_170729.pre-cleanup.bak`
+  （118 会话 / 559 消息 / 117 archived）。该目录已被 `.gitignore` 忽略。
+- **备份要用 sqlite 的 `VACUUM INTO` 而不是 `cp`**：WAL 模式下已提交但未 checkpoint 的页
+  可能仍在 `-wal` 里，只拷主文件会丢数据。用 `mode=ro` 打开备份文件还会顺手生成
+  `-shm`/`-wal`，记得清掉。
 
 ## Chroma 向量库运维铁律（2026-09-25 故障后沉淀）
 
@@ -99,11 +166,12 @@
 `ReactAgent.sessions` 经 `st.cache_resource` 进程级共享且无淘汰；
 中间件「HTTP 服务」模式形同虚设且 `HTTPServer` 非线程化、无鉴权、
 `fill_context` 的 `ctx.update(extra)` 可被请求体覆盖 `mode`；
-**悬空 tool_calls**：`react_agent.py:360-361` 先落盘 `AIMessage(tool_calls)`，之后 384-389 才逐条
-append `ToolMessage`；`_init_session` 恢复时不清洗 → 中途中断即留下缺配对 tool 响应的历史，
-恢复后调 API 直接 400 且持续复现。**代码缺陷成立**（DB 里 25 条实例是批量脚本产物，非真实崩溃）；
-**跨用户孤儿会话**：`start_new_conversation(user_id)` 只归档当前用户，`list_archived` 只查
-`status='archived'` → 旧用户 active 会话不可见也不清理（代码路径成立，暂无实例）；
+**悬空 tool_calls**（**2026-09-25 已修**）：原缺陷 —— 先落盘 `AIMessage(tool_calls)`、之后才逐条
+append `ToolMessage`，恢复时不清洗 → 中断即留下缺配对 tool 响应的历史，恢复后调 API 直接 400 且持续复现。
+修复见下方「会话历史完整性（P2）」一节；DB 里 25 条实例（id 75~99）已在读取时自动清洗；
+**跨用户孤儿会话**（**2026-09-25 已修**）：原缺陷 —— `start_new_conversation(user_id)` 只归档
+当前用户，`list_archived` 只查 `status='archived'` → 旧用户 active 会话不可见也不清理。
+修复见上方「会话状态机孤儿（P3）」一节；
 缓存无上限（`_rag_cache`/`_weather_cache` 只有 TTL、无淘汰，过期条目永不删除）；
 日志无轮转（`logger_handler.py:45` 是 `FileHandler` 非 `RotatingFileHandler`，实测单日 ~100KB）；
 `_next_6h_rain_desc` 的 `>= now_hour` 会漏掉进行中的 3 小时时段、**并把它之后的窗口数据当"未来6小时"上报**
@@ -116,10 +184,13 @@ append `ToolMessage`；`_init_session` 恢复时不清洗 → 中途中断即留
   `_get_rag()` 仍需 **38.56s**，拆解后主体是 `import rag.vector_store`（8.41s）等**模块导入 +
   客户端初始化**，不是入库（日志显示 6 个知识文件全部 MD5 命中跳过）。冷启动页面仍要等。
 - `app.py:241` 注释"输入提交后会自动 rerun"：**已修**，现为 `app.py:296-299`，并补了 `st.rerun()`。
-- `config/rag.local.yml` 的 `qwen3.8-max`：**前提不成立**，该文件不存在，模型名在 `config/rag.yml`，
+- `config/rag.local.yml` 的 `qwen3.8-max`：**前提不成立**，该文件当时不存在，模型名写在 `config/rag.yml`，
   端点为私有 MaaS，模型名可自定义，能正常初始化。
+  → **2026-09-25 已按设计意图归位**：`rag.yml` 还原为占位模板（`api_base: ""`）+ `rag.local.yml` 存真实值
+  （已被 .gitignore 忽略）+ 恢复 `config/rag.yml.example`。详见「配置分层」一节。
 - git 冲突：2026-09-25 已解决并提交合并 `a51a2c0`（README.md 工作区版早已无冲突标记，
-  只是没 `git add`）。⚠️ 另有 **13 个已跟踪文件的修改仍未提交**，待在后续修复中一并处理。
+  只是没 `git add`）。⚠️ 当时遗留的 13 个已跟踪文件改动**已于同日固化为基线提交**：
+  `7c78b58`（工作记忆同步）+ `897628b`（代码修复基线），工作区已跟踪文件干净。
 
 ### 无价值但会误导人的死代码
 `app.py:40-47` 的 `pending_switch_user` 从未被写入。
@@ -151,9 +222,12 @@ append `ToolMessage`；`_init_session` 恢复时不清洗 → 中途中断即留
   `中间件镜像（user_id 进程内存）`，不一致时给 warning —— 这是页面上唯一能直接看出"双源"的地方。
 - **报告轮结束时模式一定已自动复位 normal**，所以「📊 当前：报告模式」只在轮次被中断时出现
   （模型报错 / Streamlit Stop / 浏览器刷新）。正常跑完的报告轮侧边栏显示 💬 普通模式，不是 bug。
-- 现成参考样本：`conversations.id=153`（标题「生成我的使用报告」，`mode='report'`，archived）。
-  打开它即可复现"权威 report vs 镜像 normal"的分歧场景。
 - 无头渲染验证用 Streamlit 自带 `streamlit.testing.v1.AppTest.from_file("app.py")`，
   可直接断言 `at.exception` / `at.sidebar.*`，比手动点浏览器可靠。
-- ⚠️ `data/sessions.db` 里 user 1001 有 116 条 archived 会话，多为历次测试脚本残留，
-  侧边栏历史列表很长；未擅自清理，待用户确认。
+  ⚠️ 但它会跑 `start_new_conversation` → `archive_all_active()`，**会动真实会话库**。
+  用户自己在跑页面实例时**不要跑 AppTest**，否则会删/建用户正在用的会话。
+- 复现"权威 report vs 镜像 normal"分歧的原样本 `conversations.id=153` **已于 2026-09-25 清理**，
+  需要时在页面上重新问一次「生成我的使用报告」并中途打断即可再造。
+- ⚠️ **不要擅自杀用户的 streamlit 进程**（2026-09-25 17:02 用户自己起了 8502）。
+  需要页面验证时把启动命令交给用户，让他们自己重启（改提示词/改模块级函数后必须重启进程，
+  `st.cache_resource` 缓存着旧实例，刷新浏览器无效）。
