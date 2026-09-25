@@ -40,6 +40,27 @@ external_data = {}
 # 无状态工具：不依赖当前用户会话，可直接作为模块级变量使用
 # ============================================================
 
+# 缓存容量上限：命中 TTL 的条目会被复用，但过期条目不会自动消失。
+# 进程长期运行（客服场景常驻）时，不同 query / city 会不断累积，
+# 因此在写入时顺带淘汰：先清过期项，仍超上限则丢弃最旧的条目。
+_CACHE_MAX_ENTRIES = 128
+
+
+def _cache_put(cache: dict[str, tuple[float, str]], key: str, value: str, ttl: float) -> None:
+    """写入缓存并维持容量上限（先清过期，再按写入时间淘汰最旧）"""
+    now = time.time()
+    cache[key] = (now, value)
+    if len(cache) <= _CACHE_MAX_ENTRIES:
+        return
+
+    for k in [k for k, (ts, _) in cache.items() if now - ts >= ttl]:
+        cache.pop(k, None)
+
+    while len(cache) > _CACHE_MAX_ENTRIES:
+        oldest = min(cache, key=lambda k: cache[k][0])
+        cache.pop(oldest, None)
+
+
 # RAG 检索结果缓存：相同问题 10 分钟内直接复用，避免重复检索+重复调模型
 _rag_cache: dict[str, tuple[float, str]] = {}
 _RAG_CACHE_TTL = 600  # 秒
@@ -47,13 +68,19 @@ _RAG_CACHE_TTL = 600  # 秒
 
 @tool(description="从向量存储中检索参考资料")
 def rag_summarize(query: str) -> str:
+    # 空查询没有任何检索意义：直接返回可行动的提示，
+    # 避免把空串送进 embedding 接口与模型（既浪费一次调用，也拿不到有效上下文）
+    if not query or not query.strip():
+        logger.warning("[rag_summarize] 收到空查询，已跳过检索")
+        return "未提供检索内容，请补充具体问题后重试。"
+
     now = time.time()
     hit = _rag_cache.get(query)
     if hit and now - hit[0] < _RAG_CACHE_TTL:
         return hit[1]
 
     result = _get_rag().rag_summarize(query)
-    _rag_cache[query] = (now, result)
+    _cache_put(_rag_cache, query, result, _RAG_CACHE_TTL)
     return result
 
 
@@ -67,9 +94,14 @@ def _next_6h_rain_desc(data: dict) -> str:
     从 wttr.in j1 响应的 hourly 预报表中取"未来 6 小时"的降雨概率。
 
     wttr.in 的 weather[0].hourly 提供当天 8 个 3 小时粒度的时段
-    （time 为 "0"/"300"/.../"2100"）。这里筛选出当前时刻之后的时段，
-    取最近 2 个时段（合计约 6 小时）中的最高降雨概率；当天剩余时段
-    不足 2 个时（如 22 点后），用次日的预报顺延补齐。
+    （time 为 "0"/"300"/.../"2100"）。这里筛选出**尚未结束**的时段，取最近
+    2 个（合计约 6 小时）中的最高降雨概率；当天剩余时段不足 2 个时
+    （如 22 点后），用次日的预报顺延补齐。
+
+    判据是「时段结束时刻（起始整点 + 3）晚于当前」，而不是「起始整点 >= 当前」：
+    后者会把正在进行的那个时段排除掉，等于把 3 小时后的窗口当成"未来 6 小时"
+    上报（例如 04:30 问天气，却报 06:00~12:00 的概率，正好漏掉眼下这段）。
+    取 2 个时段而不是 3 个，是为了不把窗口无谓拉长、避免概率被高估。
 
     取不到任何预报数据时返回空字符串——调用方据此整段省略降雨描述，
     绝不使用固定文案，避免向模型传递与实况无关的结论。
@@ -81,7 +113,11 @@ def _next_6h_rain_desc(data: dict) -> str:
 
         now_hour = datetime.now().hour
         hourly = days[0].get("hourly") or []
-        upcoming = [h for h in hourly if int(h.get("time", 0)) // 100 >= now_hour]
+        # time 为 "0"/"300"/.../"2100"，除以 100 得到时段起始整点
+        upcoming = [
+            h for h in hourly
+            if int(h.get("time", 0)) // 100 + 3 > now_hour
+        ]
 
         if len(upcoming) < 2 and len(days) > 1:
             upcoming += days[1].get("hourly") or []  # 跨天补齐
@@ -90,7 +126,9 @@ def _next_6h_rain_desc(data: dict) -> str:
         if not slots:
             return ""
 
-        chances = [int(s.get("chanceofrain", 0)) for s in slots]
+        # chanceofrain 偶尔返回空串，用 `or 0` 兜底，避免 int("") 抛异常导致
+        # 整段降雨描述被静默丢弃（温度/湿度等有效信息不受影响）
+        chances = [int(s.get("chanceofrain") or 0) for s in slots]
         if not chances:
             return ""
 
@@ -143,7 +181,7 @@ def get_weather(city: str) -> str:
         rain_desc = _next_6h_rain_desc(data)
         if rain_desc:
             result += f"，{rain_desc}"
-        _weather_cache[city] = (now, result)
+        _cache_put(_weather_cache, city, result, _WEATHER_CACHE_TTL)
         return result
     except Exception as e:
         logger.warning(f"[get_weather] 调用失败: {e}")

@@ -1,4 +1,5 @@
 import logging
+import logging.handlers
 from utils.path_tool import get_abs_path
 import os
 from datetime import datetime
@@ -39,10 +40,15 @@ def get_logger(
     logger.addHandler(console_handler)
 
     # 文件Handler
+    # 用 RotatingFileHandler 而非 FileHandler：日志文件名按天生成，但单日量并不小
+    # （实测单日约 100KB，接入更多工具调用后会更高），不轮转的话文件会无限增长。
+    # 单文件 5MB、保留 5 个滚动备份，足以覆盖历史排查需求。
     if not log_file:        # 日志文件的存放路径
         log_file = os.path.join(LOG_ROOT, f"{name}_{datetime.now().strftime('%Y%m%d')}.log")
 
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding='utf-8'
+    )
     file_handler.setLevel(file_level)
     file_handler.setFormatter(DEFAULT_LOG_FORMAT)
 

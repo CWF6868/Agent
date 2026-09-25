@@ -162,27 +162,64 @@ D 真实库只读体检），报告 `_p3_report.json`。
 `get_weather` 的 `lang_zh` 空列表 IndexError **2026-09-25 已修**（见下方"工具健壮性"）。
 
 ### P1/P2（2026-09-25 第二轮逐条核查后更新）
-`save_conversation` 全量重写 O(n²)（`session_store.py:317-326`，实测成立）；
-`ReactAgent.sessions` 经 `st.cache_resource` 进程级共享且无淘汰；
-中间件「HTTP 服务」模式形同虚设且 `HTTPServer` 非线程化、无鉴权、
-`fill_context` 的 `ctx.update(extra)` 可被请求体覆盖 `mode`；
+**`save_conversation` 全量重写 O(n²)**（**2026-09-25 已修**）：原缺陷 —— 每次调用先
+`DELETE` 全部消息再全量 `INSERT`，一轮对话触发 4~6 次，单次成本 O(历史长度) ⇒ O(n²)。
+修复：新增 `SessionStore.append_messages(conv_id, mode, new_messages)`，seq 从既有
+`MAX(seq)+1` 接续、只写新增段；`ReactAgent._persist_session` 按 `session["_saved_len"]`
+切片调用（`_init_session` 恢复时把该值初始化为恢复出的历史长度）。`save_conversation`
+保留给"覆盖既有历史"的场景（测试预置 / 外部调用方），语义未变。
+实测：301 条历史的会话跑一轮对话，SQL 影响行数 **2432 → 8**（304×）；验证脚本
+根目录 `_verify_p4.py`（A 等价性 / B 写放大 / C 边界 / D 真 Agent 桩模型 / E 与 sanitize 共存）。
+⚠️ **`_saved_len` 前提是"历史只追加不截断/重排"** —— 已 grep 全项目确认
+（`react_agent.py` 只有 `append`/`extend`）；若将来出现截断逻辑，`_persist_session`
+的 `saved > len(history)` 防御分支会回退全量写，但正常截断需要显式同步该计数。
+
+**`ReactAgent.sessions` 仍经 `st.cache_resource` 进程级共享且无淘汰**（未改）：会话数由
+conversation_id 决定，单用户演示规模下无实际影响，属已知设计取舍 —— 要改就得引入 LRU 并
+处理"被淘汰会话再次提问"的恢复路径，收益不足；
+**中间件「HTTP 服务」**（2026-09-25 已加固）：`HTTPServer` → `ThreadingHTTPServer`、
+`fill_context` 的 `ctx.update(extra)` 加**受控字段白名单**（请求体不能再覆盖
+`mode`/`prompt_type`/`user_id`，非受控自定义字段照常合并）、`_read_json` 遇到非法 JSON
+按空处理返回 400 而非冒泡 500。**仍无鉴权**（有意保留：默认只绑 127.0.0.1，且中间件已非
+模式权威源，加 token 会牵动 agent 侧调用契约，收益不足）；
 **悬空 tool_calls**（**2026-09-25 已修**）：原缺陷 —— 先落盘 `AIMessage(tool_calls)`、之后才逐条
 append `ToolMessage`，恢复时不清洗 → 中断即留下缺配对 tool 响应的历史，恢复后调 API 直接 400 且持续复现。
 修复见下方「会话历史完整性（P2）」一节；DB 里 25 条实例（id 75~99）已在读取时自动清洗；
 **跨用户孤儿会话**（**2026-09-25 已修**）：原缺陷 —— `start_new_conversation(user_id)` 只归档
 当前用户，`list_archived` 只查 `status='archived'` → 旧用户 active 会话不可见也不清理。
 修复见上方「会话状态机孤儿（P3）」一节；
-缓存无上限（`_rag_cache`/`_weather_cache` 只有 TTL、无淘汰，过期条目永不删除）；
-日志无轮转（`logger_handler.py:45` 是 `FileHandler` 非 `RotatingFileHandler`，实测单日 ~100KB）；
-`_next_6h_rain_desc` 的 `>= now_hour` 会漏掉进行中的 3 小时时段、**并把它之后的窗口数据当"未来6小时"上报**
-（实测 now=04:30 报 40% 来自 09:00 段）；requirements.txt 缺 `dashscope`（`model/factory.py:36` 用的
-`langchain_community.embeddings.DashScopeEmbeddings` 运行时必需）且全部 `>=` 未锁版本；
-`eval_questions.py` 源码丢失（只剩 .pyc）。
+**缓存无上限**（**2026-09-25 已修**）：原缺陷 —— `_rag_cache`/`_weather_cache` 只有 TTL 判断，
+过期条目永不删除、字典无容量上限 ⇒ 常驻进程内存无界增长。修复：新增
+`agents_tools._cache_put(cache, key, value, ttl)` + `_CACHE_MAX_ENTRIES=128`，
+写入时先清过期项、仍超上限则按写入时间淘汰最旧，两个缓存统一走它；
+**日志无轮转**（**2026-09-25 已修**）：`logger_handler.py` 由 `FileHandler` 改为
+`RotatingFileHandler(maxBytes=5MB, backupCount=5)`（注意须 `import logging.handlers`，
+只 `import logging` 不带子模块）；
+**`_next_6h_rain_desc` 的时段判据**（**2026-09-25 已修**）：原 `start >= now_hour` 有**两个**
+方向的错 —— 既漏掉进行中的 3 小时时段，又**取到窗口之外的数据**（实测 now=04:30 报 40%
+来自 09:00 段）。改为 `start + 3 > now_hour`；同时 `chanceofrain` 用 `or 0` 兜空串
+（空串会让 `int("")` 抛异常 → 整段降雨描述被静默吞掉）。**取 2 个时段而非 3 个是有意的**：
+3 个会把窗口拉到约 9 小时，`max()` 出的概率被系统性高估；
+**工具边界**（**2026-09-25 已修**）：`_execute_tool` 的 `name` 取 `or ""`、`args` 取 `or {}`
+（`get("args", {})` 在值为 `None` 时仍返回 `None`，直接 `invoke(None)` 会抛错），空工具名
+单独给"请重新选择工具"而非误导性的"工具 '' 不存在"；`rag_summarize` 对空/纯空白 query
+短路，不进 embedding 也不进模型；
+**requirements.txt**（**2026-09-25 已修**）：补 `dashscope==1.27.3`（`model/factory.py:36` 用的
+`langchain_community.embeddings.DashScopeEmbeddings` 运行时必需），并把全部 `>=` 改为
+**实测版本 `==`**（Python 3.11 跑通的组合记录在文件头注释）；
+**`eval_questions.py` 源码丢失（只剩 .pyc）** —— 仍未处理。
 
 ### 已核实为误报 / 已修（2026-09-25 二轮）
-- 首次 RAG 阻塞 28 秒：**已修**，预热挪到 app 启动。但代价是"挪走"不是"消除"——实测首次
-  `_get_rag()` 仍需 **38.56s**，拆解后主体是 `import rag.vector_store`（8.41s）等**模块导入 +
-  客户端初始化**，不是入库（日志显示 6 个知识文件全部 MD5 命中跳过）。冷启动页面仍要等。
+- 首次 RAG 阻塞 28 秒：**已修**，预热挪到 app 启动。但代价是"挪走"不是"消除"——冷启动页面
+  仍要等。**2026-09-25 二次实测（热盘）**：`import rag.vector_store`（=chromadb 等）**8.70s**
+  + `import rag.rag_service` 0.10s + `RagSummarizeService()`（Chroma 客户端 + embedding 构造
+  + 6 文件 MD5 检查）**5.67s** = **14.47s**（早前 38.56s 那次是冷盘/首次）。
+  → **决定不改后台线程预热**：① 这 15~40 秒每进程只付一次（`st.cache_resource`），非每次交互；
+  ② 后台预热会重新引入"写 Chroma 与读 Chroma 并发"，正是 `hnsw segment reader: Nothing found
+  on disk` 那个已修重大故障的成因，**收益与风险不成比例**；③ 大头是第三方库导入成本，无低成本解法。
+  已改为**让等待可预期**：`app.py` spinner 明说"仅首次启动需等待约 15~40 秒"。
+  若日后要压这部分，正确做法是单独立项：RAG 拆成独立进程（Chroma 单写者）+ agent 侧走 HTTP，
+  顺带根治"读写不能并发"的约束 —— **不要混在杂项里做**。
 - `app.py:241` 注释"输入提交后会自动 rerun"：**已修**，现为 `app.py:296-299`，并补了 `st.rerun()`。
 - `config/rag.local.yml` 的 `qwen3.8-max`：**前提不成立**，该文件当时不存在，模型名写在 `config/rag.yml`，
   端点为私有 MaaS，模型名可自定义，能正常初始化。
@@ -192,10 +229,14 @@ append `ToolMessage`，恢复时不清洗 → 中断即留下缺配对 tool 响�
   只是没 `git add`）。⚠️ 当时遗留的 13 个已跟踪文件改动**已于同日固化为基线提交**：
   `7c78b58`（工作记忆同步）+ `897628b`（代码修复基线），工作区已跟踪文件干净。
 
-### 无价值但会误导人的死代码
-`app.py:40-47` 的 `pending_switch_user` 从未被写入。
-（"输入提交后会自动 rerun"那条错误注释已于 2026-09-25 修正：在对话收尾补了 `st.rerun()`，
-否则侧边栏模式指示器会滞后一轮。）
+### 无价值但会误导人的死代码（2026-09-25 已清）
+`app.py` 的 `pending_switch_user` 从未被写入过。**已删除**，只保留 `user_id_input`
+默认值预置（并改写注释说明"为什么不用 text_input 的 value= 参数"）。
+同时修掉同一类的"渲染滞后一轮"：`st.button` 点击本身就是那次 rerun，但处理器运行时
+**它上方的组件已经渲染完**，所以侧边栏模式指示器会显示上一会话的模式。已在
+「🆕 新对话」与「历史会话载入」两处处理器末尾补 `st.rerun()`，并把
+"点击后 Streamlit 会自动 rerun，无需手动调用"这条**看似正确其实误导**的注释改写清楚。
+（对话路径的同类问题更早已修，见上条。）
 
 ## 报告提示词 report_prompt.txt（2026-09-25 重写）
 
@@ -224,8 +265,14 @@ append `ToolMessage`，恢复时不清洗 → 中断即留下缺配对 tool 响�
   （模型报错 / Streamlit Stop / 浏览器刷新）。正常跑完的报告轮侧边栏显示 💬 普通模式，不是 bug。
 - 无头渲染验证用 Streamlit 自带 `streamlit.testing.v1.AppTest.from_file("app.py")`，
   可直接断言 `at.exception` / `at.sidebar.*`，比手动点浏览器可靠。
-  ⚠️ 但它会跑 `start_new_conversation` → `archive_all_active()`，**会动真实会话库**。
-  用户自己在跑页面实例时**不要跑 AppTest**，否则会删/建用户正在用的会话。
+  ⚠️ 但它会跑 `start_new_conversation` → 全局 `archive_all_active()`，**会动真实会话库**。
+  **2026-09-25 起已解决**：`SessionStore.__init__` 支持 `AGENT_SESSION_DB` 环境变量覆盖
+  （仅供测试，生产不设该变量即走 config 默认路径）；`test_app_history.py` 已在文件顶部
+  指向临时目录并在 finally 里删除。验证方式：跑测试前后比对 `data/sessions.db` 的**整文件 MD5**。
+  → 现在可以安全地跑页面级测试了（此前记录"不要跑 AppTest"的约束**已过期**）。
+- AppTest 用法坑：`at.session_state` 是 `SafeSessionState`，**没有 `.get()`**（要用
+  `try/except KeyError`）；旧 run 树的按钮对象点击会失效，每次点击前须重新收集。
+  完整清单见技能 `streamlit-apptest-safe-verification`。
 - 复现"权威 report vs 镜像 normal"分歧的原样本 `conversations.id=153` **已于 2026-09-25 清理**，
   需要时在页面上重新问一次「生成我的使用报告」并中途打断即可再造。
 - ⚠️ **不要擅自杀用户的 streamlit 进程**（2026-09-25 17:02 用户自己起了 8502）。

@@ -24,7 +24,7 @@
 import json
 import threading
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 from utils.logger_handler import logger
@@ -38,6 +38,11 @@ _store_lock = threading.Lock()
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 
+# 上下文中的受控字段：取值由中间件自身决定，不接受 extra / 请求体覆盖。
+# 否则 POST /context/fill 的 body 里带上 {"mode": "normal"} 就能把刚注入的
+# 报告上下文改回普通模式，让进程内存镜像与实际状态脱节。
+_CONTROLLED_CONTEXT_KEYS = ("user_id", "mode", "prompt_type", "filled_at")
+
 
 # ============================================================
 # 核心操作函数（可直接 import 调用，无需启动 HTTP 服务）
@@ -50,7 +55,8 @@ def fill_context(user_id: str, extra: dict = None) -> dict:
 
     Args:
         user_id: 用户 ID
-        extra: 额外上下文字段，会合并到上下文中
+        extra: 额外上下文字段，会合并到上下文中（受控字段不可覆盖，见
+            _CONTROLLED_CONTEXT_KEYS）
 
     Returns:
         注入后的完整上下文字典
@@ -63,7 +69,10 @@ def fill_context(user_id: str, extra: dict = None) -> dict:
             "filled_at": datetime.now().isoformat(),
         }
         if extra:
-            ctx.update(extra)
+            ctx.update({
+                k: v for k, v in extra.items()
+                if k not in _CONTROLLED_CONTEXT_KEYS
+            })
         _context_store[user_id] = ctx
     logger.info(f"[middleware] 已为用户 {user_id} 注入报告上下文，模式切换为 report")
     return ctx
@@ -124,7 +133,13 @@ class MiddlewareHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
             return {}
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            # 请求体不是合法 JSON：按空上下文处理，由调用方按"缺少 user_id"返回 400，
+            # 不要让异常冒泡成 500（对外接口应给出可理解的错误码）
+            logger.warning(f"[middleware] 请求体解析失败，按空处理: {e}")
+            return {}
 
     def do_POST(self):
         if self.path == "/context/fill":
@@ -172,8 +187,13 @@ class MiddlewareHandler(BaseHTTPRequestHandler):
 
 
 def start_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
-    """启动中间件 HTTP 服务（阻塞运行）"""
-    server = HTTPServer((host, port), MiddlewareHandler)
+    """启动中间件 HTTP 服务（阻塞运行）
+
+    使用 ThreadingHTTPServer 而非 HTTPServer：后者单线程串行处理请求，
+    一个慢请求会阻塞其它调用（agent 的 fill_context_for_report 有 3 秒超时，
+    正好会踩到）。
+    """
+    server = ThreadingHTTPServer((host, port), MiddlewareHandler)
     logger.info(f"[middleware] 中间件服务启动: http://{host}:{port}")
     logger.info(f"[middleware] 可用接口: POST /context/fill, GET /context/get, POST /context/clear, GET /health")
     try:

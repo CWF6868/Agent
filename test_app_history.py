@@ -6,9 +6,21 @@ Streamlit AppTest 交互验证（多会话流程）：
 3. 点击历史记录 → 加载该记录全部对话
 4. 点击「新对话」→ 回到空状态，历史记录保留
 运行：python test_app_history.py
+
+⚠️ 本测试会把会话库切到临时文件（环境变量 AGENT_SESSION_DB）。
+原因：AppTest 会真实执行 app.py 的模块级代码，其中
+`start_new_conversation()` 会调用全局 `archive_all_active()` —— 直接指向
+data/sessions.db 时，会把正在使用的会话归档，空会话还会被直接删除。
+加这层隔离前，跑一次本测试就会清空真实库里的 active 会话。
 """
 import os
+import shutil
 import sys
+import tempfile
+
+_TMP_DIR = tempfile.mkdtemp(prefix="apptest_history_")
+# setdefault：外部已指定库路径时（例如 CI 想复用它）不覆盖
+os.environ.setdefault("AGENT_SESSION_DB", os.path.join(_TMP_DIR, "sessions.db"))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -98,6 +110,8 @@ def main():
     finally:
         store.clear_user(TEST_USER)
         print("测试数据已清理")
+        shutil.rmtree(_TMP_DIR, ignore_errors=True)
+        print(f"临时会话库已删除：{_TMP_DIR}")
 
     print("-" * 40)
     if FAIL:

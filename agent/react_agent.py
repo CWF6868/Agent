@@ -100,12 +100,35 @@ class ReactAgent:
             self.sessions[conversation_id] = {
                 "mode": restored["mode"],   # normal | report
                 "history": restored["history"],  # LangChain Message 列表
+                # 已落盘的消息条数：恢复出来的历史本就都在库里，故初始化为其长度。
+                # 供 _persist_session 增量写入时定位"尚未落盘的那一段"。
+                "_saved_len": len(restored["history"]),
             }
         return self.sessions[conversation_id]
 
     def _persist_session(self, conversation_id: int, session: dict):
-        """将会话（模式 + 完整历史）全量写回 SQLite"""
-        self.store.save_conversation(conversation_id, session["mode"], session["history"])
+        """
+        把会话的模式与**尚未落盘的新增消息**写回 SQLite（增量）。
+
+        历史只会往末尾追加，因此每次只需写 `history[_saved_len:]`。
+        原先每轮都全量 DELETE + 重插（一轮对话 4~6 次 × O(历史长度)），
+        对话变长后写放大是 O(n²)；现在单次成本只与本次新增条数相关。
+        """
+        history = session["history"]
+        saved = session.get("_saved_len", 0)
+
+        if saved > len(history):
+            # 防御分支：长度回退（例如外部直接改写了 store）时，退回全量写以保证
+            # 落盘内容与内存一致；正常流程不会走到这里
+            logger.warning(
+                f"[ReactAgent] 会话 {conversation_id} 已落盘计数 {saved} 超过历史长度 "
+                f"{len(history)}，回退全量写入"
+            )
+            self.store.save_conversation(conversation_id, session["mode"], history)
+        else:
+            self.store.append_messages(conversation_id, session["mode"], history[saved:])
+
+        session["_saved_len"] = len(history)
 
     def get_mode(self, conversation_id: int) -> str:
         """
@@ -151,8 +174,17 @@ class ReactAgent:
         Returns:
             工具执行结果的字符串形式
         """
-        name = tool_call.get("name")
-        args = tool_call.get("args", {})
+        name = tool_call.get("name") or ""
+        # args 可能为 None（流式解析偶尔产出 name='' / args=None 的残缺 chunk），
+        # 直接交给 tool.invoke(None) 会抛错并让整轮降级为"工具执行失败"
+        args = tool_call.get("args") or {}
+
+        if not name:
+            logger.warning(f"[ReactAgent] 收到空工具名，已跳过: {tool_call}")
+            return (
+                "错误：工具名为空，无法执行。"
+                "请重新选择可用的工具，或直接基于已有信息回答。"
+            )
 
         tool = tools_map.get(name)
         if tool is None:

@@ -181,7 +181,12 @@ class SessionStore:
 
     def __init__(self, db_path: str = None):
         if db_path is None:
-            db_path = get_abs_path(agent_conf.get("session_db_path", "data/sessions.db"))
+            # 环境变量覆盖仅供测试使用：让页面级验证（Streamlit AppTest 会真实地
+            # 新建/归档会话）指向临时库，避免污染正在使用的 data/sessions.db。
+            # 生产运行时该变量不存在，走 config/agent.yml 的 session_db_path。
+            db_path = os.getenv("AGENT_SESSION_DB") or get_abs_path(
+                agent_conf.get("session_db_path", "data/sessions.db")
+            )
         self.db_path = db_path
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._lock = threading.Lock()
@@ -390,8 +395,61 @@ class SessionStore:
             "history": sanitize_history([_row_to_msg(r) for r in rows]),
         }
 
+    def append_messages(self, conv_id: int, mode: str, new_messages: list) -> int:
+        """
+        增量追加消息（不重写既有行），并同步 mode / title / status / updated_at。
+
+        与 save_conversation 的区别：save_conversation 每次调用都先 DELETE 全部
+        消息再全量 INSERT。一轮对话会触发 4~6 次写入（用户消息、每轮 AI+工具响应、
+        最终回答、报告模式切换），单次成本又是 O(历史长度)，合起来是 O(n²) 的
+        磁盘写放大 —— 对话一长就明显变慢。而历史只会在**末尾追加**，所以只需写入
+        尚未落盘的那一段：seq 从既有 MAX(seq)+1 接续，单次写放大降到"本次新增条数"。
+
+        new_messages 为空时只做状态同步（例如仅切换了 mode），不产生 INSERT。
+
+        Args:
+            conv_id: 会话 ID
+            mode: 当前模式（normal | report）
+            new_messages: 本次新增的 LangChain Message 列表（按时间顺序）
+
+        Returns:
+            实际写入的消息条数；会话已被删除时返回 0。
+        """
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT title FROM conversations WHERE id=?", (conv_id,)
+            ).fetchone()
+            if row is None:
+                return 0  # 会话已被删除，忽略写入
+            title = row["title"] or _make_title(new_messages)
+
+            if new_messages:
+                base = conn.execute(
+                    "SELECT COALESCE(MAX(seq), -1) FROM conv_messages WHERE conversation_id=?",
+                    (conv_id,),
+                ).fetchone()[0]
+                conn.executemany(
+                    "INSERT INTO conv_messages(conversation_id, seq, role, content, payload, created_at) "
+                    "VALUES(:conversation_id, :seq, :role, :content, :payload, :created_at)",
+                    [
+                        _msg_to_row(conv_id, base + 1 + i, m)
+                        for i, m in enumerate(new_messages)
+                    ],
+                )
+
+            conn.execute(
+                "UPDATE conversations SET title=?, mode=?, status='active', updated_at=? WHERE id=?",
+                (title, mode, _now(), conv_id),
+            )
+            conn.commit()
+            return len(new_messages)
+
     def save_conversation(self, conv_id: int, mode: str, history: list) -> None:
-        """全量写回会话（消息先清后插；首次对话时自动生成标题）"""
+        """全量写回会话（消息先清后插；首次对话时自动生成标题）
+
+        仅用于需要**覆盖**既有历史的场景（测试预置数据、外部调用方）。
+        增量追加请用 append_messages()。
+        """
         with self._lock, self._connection() as conn:
             row = conn.execute(
                 "SELECT user_id, title FROM conversations WHERE id=?", (conv_id,)

@@ -1,34 +1,44 @@
 # ============================================================
 # 扫地机器人智能客服 Agent —— Python 依赖
 # 安装：pip install -r requirements.txt
+#
+# 版本策略：以下版本为本机实测跑通的组合（Python 3.11），统一用 == 精确锁定。
+# 原来全部写 >=，装出来的实际版本不可复现——上游一次小版本升级就可能改变
+# LangChain 的工具绑定 / 检索行为，而这类回归极难定位，因此改为一律锁定。
+# 需要升级时请有意为之：改这里 → 跑 verify_tools.py 与 _verify_p3.py 回归。
 # ============================================================
 
 # ---------- Web 界面 ----------
-streamlit>=1.30.0
+streamlit==1.63.0
 
 # ---------- LangChain 核心 ----------
-langchain>=0.3.0
-langchain-core>=0.3.0
-langchain-community>=0.3.0
-langchain-openai>=0.2.0
-langchain-text-splitters>=0.3.0
+langchain==1.3.18
+langchain-core==1.6.2
+langchain-community==0.4.2
+langchain-openai==1.6.0
+langchain-text-splitters==1.1.2
 
 # ---------- RAG / 向量库 ----------
-langchain-chroma>=0.1.4
-chromadb>=0.5.0
+langchain-chroma==1.1.0
+chromadb==1.5.9
+
+# ---------- Embedding（阿里云百炼）----------
+# model/factory.py 使用 langchain_community.embeddings.DashScopeEmbeddings，
+# 该封装在运行时会 import dashscope，缺少本包会直接 ModuleNotFoundError
+dashscope==1.27.3
 
 # ---------- 文档加载 ----------
-pypdf>=4.0.0
+pypdf==6.17.0
 
 # ---------- 配置 ----------
-PyYAML>=6.0
+PyYAML==6.0.3
 # 读取项目根目录下的 .env（由 .env.example 复制而来），使文档说明与实际行为一致
-python-dotenv>=1.0.0
+python-dotenv==1.2.2
 
 # ============================================================
-# 说明：
-# - Embedding 使用 DashScope（阿里云百炼）时，需要额外安装：
-#       pip install dashscope
-#   并设置环境变量 DASHSCOPE_API_KEY
-# - 对话模型通过 OpenAI 兼容接口调用，密钥读取环境变量 OPENAI_API_KEY
+# 环境变量：
+# - DASHSCOPE_API_KEY：embedding 模型鉴权（必需）
+# - OPENAI_API_KEY  ：对话模型鉴权（必需）
+# - 端点由 config/rag.yml 的 api_base 提供（本地私有 MaaS 地址，
+#   已从被跟踪的配置文件拆到 config/rag.local.yml，见 .gitignore）
 # ============================================================

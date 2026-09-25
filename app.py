@@ -35,17 +35,13 @@ st.set_page_config(
 
 
 # ============================================================
-# 历史会话切换处理（必须在 user_id 输入框实例化之前执行）
+# 用户 ID 默认值
 # ============================================================
-# Streamlit 不允许在 widget 实例化后再修改其 session_state 值，
-# 因此点击历史会话时只写入 pending_switch_user（普通状态键），
-# 在下一轮 rerun 的最开头、user_id 输入框尚未实例化时再写入其 key。
-# 默认用户也在这一阶段统一初始化，避免与 text_input 的 value 参数冲突。
+# 必须在 user_id 输入框（下方 st.text_input(key="user_id_input")）实例化之前写入。
+# 为什么不用 text_input 的 value= 参数：Streamlit 在 key 已存在于 session_state 时
+# 同时传 value= 会告警，所以统一在这里预置默认值。
 if "user_id_input" not in st.session_state:
     st.session_state["user_id_input"] = "1001"
-
-if "pending_switch_user" in st.session_state:
-    st.session_state["user_id_input"] = st.session_state.pop("pending_switch_user")
 
 
 # ============================================================
@@ -80,7 +76,10 @@ def warm_up_knowledge_base() -> bool:
         return False
 
 
-with st.spinner("正在加载知识库..."):
+# 首次启动需连接 Chroma 并构造 embedding 客户端（实测热盘约 15 秒、冷盘更久），
+# 这一步无法省掉，但要让用户知道在等什么、要等多久，而不是对着空白页面猜。
+# 后续每次 rerun 命中 st.cache_resource 缓存，瞬时返回。
+with st.spinner("正在加载知识库（仅首次启动需等待约 15~40 秒）..."):
     warm_up_knowledge_base()
 
 
@@ -181,9 +180,12 @@ with st.sidebar:
     st.divider()
 
     # 新对话按钮：归档当前会话 → 开始新的空会话（历史记录不会被删除）
-    # 按钮点击后 Streamlit 会自动 rerun，无需手动调用
+    # 关于 rerun：按钮点击本身已经触发过一次 rerun，但本处理器是在**侧边栏渲染完之后**
+    # 才执行的（模式指示器在上方），所以状态变更要到下一轮才反映出来，会看到上一会话的
+    # 模式。显式 rerun 一次让指示器立刻跟上，避免"看起来卡在报告模式"的错觉。
     if st.button("🆕 新对话", use_container_width=True, type="secondary"):
         start_new_conversation(user_id)
+        st.rerun()
 
     st.divider()
 
@@ -211,6 +213,9 @@ with st.sidebar:
                     st.session_state.current_conv_id = conv["id"]
                     st.session_state.messages = session_store.build_ui_messages(conv["id"])
                     st.session_state.current_conv_user = user_id
+                    # 同「新对话」：处理器执行时侧边栏已渲染完毕，显式 rerun 才能让
+                    # 模式指示器显示刚载入会话的模式，而不是上一会话的
+                    st.rerun()
             with col2:
                 with st.popover("🗑"):
                     st.caption("删除这条历史记录？")
