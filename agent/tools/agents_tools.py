@@ -62,6 +62,51 @@ _weather_cache: dict[str, tuple[float, str]] = {}
 _WEATHER_CACHE_TTL = 1800  # 秒
 
 
+def _next_6h_rain_desc(data: dict) -> str:
+    """
+    从 wttr.in j1 响应的 hourly 预报表中取"未来 6 小时"的降雨概率。
+
+    wttr.in 的 weather[0].hourly 提供当天 8 个 3 小时粒度的时段
+    （time 为 "0"/"300"/.../"2100"）。这里筛选出当前时刻之后的时段，
+    取最近 2 个时段（合计约 6 小时）中的最高降雨概率；当天剩余时段
+    不足 2 个时（如 22 点后），用次日的预报顺延补齐。
+
+    取不到任何预报数据时返回空字符串——调用方据此整段省略降雨描述，
+    绝不使用固定文案，避免向模型传递与实况无关的结论。
+    """
+    try:
+        days = data.get("weather") or []
+        if not days:
+            return ""
+
+        now_hour = datetime.now().hour
+        hourly = days[0].get("hourly") or []
+        upcoming = [h for h in hourly if int(h.get("time", 0)) // 100 >= now_hour]
+
+        if len(upcoming) < 2 and len(days) > 1:
+            upcoming += days[1].get("hourly") or []  # 跨天补齐
+
+        slots = upcoming[:2]
+        if not slots:
+            return ""
+
+        chances = [int(s.get("chanceofrain", 0)) for s in slots]
+        if not chances:
+            return ""
+
+        peak = max(chances)
+        if peak >= 60:
+            level = "较高"
+        elif peak >= 30:
+            level = "中等"
+        else:
+            level = "较低"
+        return f"未来6小时降雨概率最高{peak}%（{level}）"
+    except Exception as e:
+        logger.warning(f"[get_weather] 解析降雨概率失败: {e}")
+        return ""
+
+
 @tool(description="获取指定城市的天气，以消息字符串的形式返回")
 def get_weather(city: str) -> str:
     """调用 wttr.in 免费天气 API 获取实时天气，无需 API Key。"""
@@ -78,18 +123,26 @@ def get_weather(city: str) -> str:
             data = json.loads(resp.read().decode("utf-8"))
 
         current = data["current_condition"][0]
-        # 优先取中文描述，兜底取英文
+        # 优先取中文描述，兜底取英文。
+        # 注意：必须用 `or [{}]` 而不是 `get(key, [{}])`——get 的默认值只在 key 缺失时
+        # 生效，key 存在但值为空列表时 [0] 会抛 IndexError，导致整条天气降级为
+        # "暂时无法获取"（而 weatherDesc 里其实有可用描述）。
+        # weatherDesc 兜底同样处理：两者都取不到时用"未知"，不丢弃温度/湿度等有效信息。
         weather_desc = (
-            current.get("lang_zh", [{}])[0].get("value")
-            or current["weatherDesc"][0]["value"]
+            (current.get("lang_zh") or [{}])[0].get("value")
+            or (current.get("weatherDesc") or [{}])[0].get("value")
+            or "未知"
         )
         result = (
             f"城市{city}天气为{weather_desc}，"
             f"气温{current['temp_C']}摄氏度，"
             f"空气湿度{current['humidity']}%，"
-            f"{current['winddir16Point']}风{current['windspeedKmph']}公里/小时，"
-            f"最近6小时降雨概率极低"
+            f"{current['winddir16Point']}风{current['windspeedKmph']}公里/小时"
         )
+        # 降雨概率为真实预报值；取不到时整段省略，不编造
+        rain_desc = _next_6h_rain_desc(data)
+        if rain_desc:
+            result += f"，{rain_desc}"
         _weather_cache[city] = (now, result)
         return result
     except Exception as e:
@@ -157,19 +210,46 @@ def generate_external_data(force: bool = False):
     logger.info(f"[generate_external_data]已加载外部数据：{len(external_data)} 个用户")
 
 
-@tool(description="从外部系统中获取指定用户在指定月份的使用记录，以纯字符串形式返回， 如果未检索到返回空字符串")
+@tool(description="从外部系统中获取指定用户在指定月份的使用记录，以纯字符串形式返回。"
+                  "若该月无记录，会自动回退到该用户最近一个有数据的月份，并在返回结果中以"
+                  "'实际月份'字段说明——此时报告中必须注明实际使用的月份，不得编造当月数据。"
+                  "该用户完全无记录时返回空字符串")
 def fetch_external_data(user_id: str, month: str) -> str:
     generate_external_data()
 
-    try:
-        record = external_data[user_id][month]
-    except KeyError:
-        logger.warning(f"[fetch_external_data]未能检索到用户：{user_id}在{month}的使用记录数据")
+    months = external_data.get(user_id)
+    if not months:
+        logger.warning(f"[fetch_external_data]用户 {user_id} 无任何使用记录")
         return ""
 
-    # 工具描述约定返回纯字符串，这里显式序列化为 JSON 文本，
-    # 避免把 dict 直接交给模型（字符串化后是 Python 字面量风格，不易读且引号不规范）
-    return json.dumps(record, ensure_ascii=False)
+    if month in months:
+        # 工具描述约定返回纯字符串，这里显式序列化为 JSON 文本，
+        # 避免把 dict 直接交给模型（字符串化后是 Python 字面量风格，不易读且引号不规范）
+        return json.dumps(months[month], ensure_ascii=False)
+
+    # 请求月份无数据：回退到语义上最接近的有数据月份，并显式告知模型。
+    # 月份键为 "YYYY-MM" 格式，字符串序即时间序，可直接比较。
+    available = sorted(months.keys())
+    if month < available[0]:
+        fallback = available[0]
+    elif month > available[-1]:
+        fallback = available[-1]
+    else:
+        # 落在数据区间内的空洞（如某月缺失）：取不晚于请求月份的最近月份
+        fallback = max(m for m in available if m <= month)
+
+    logger.warning(
+        f"[fetch_external_data]用户 {user_id} 在 {month} 无使用记录，已回退到 {fallback}"
+    )
+    return json.dumps(
+        {
+            "实际月份": fallback,
+            "用户请求月份": month,
+            "数据说明": f"{month} 无使用记录，以下为最近的有数据月份（{fallback}）",
+            **months[fallback],
+        },
+        ensure_ascii=False,
+    )
 
 
 # ============================================================

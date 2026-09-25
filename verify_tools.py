@@ -120,11 +120,21 @@ check("fill_context_for_report 可调用", fill_context_check)
 
 
 def weather_check():
-    """天气 API 依赖网络，失败只警告不报错"""
+    """天气 API 依赖网络，失败只警告不报错。
+
+    注意：不能只断言"包含城市名"——降级文案"城市深圳天气信息暂时无法获取"
+    同样包含城市名，会让解析失败（如 lang_zh 为空列表导致 IndexError）
+    这类 bug 静默通过。这里改为要求返回体包含实际的观测字段。
+    """
     try:
         result = get_weather.invoke({"city": "深圳"})
         print(f"   天气返回 = {result[:60]}...")
         assert "深圳" in result, "返回中应包含城市名"
+        assert "暂时无法获取" not in result, f"天气查询降级，疑似解析异常: {result}"
+        assert "摄氏度" in result and "湿度" in result, f"返回体缺少观测字段: {result}"
+        assert "天气为None" not in result and "天气为未知" not in result, (
+            f"天气描述解析失败: {result}"
+        )
     except Exception as e:
         print(f"   {WARN} 天气 API 调用失败（可能是网络问题）: {e}")
 

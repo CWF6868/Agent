@@ -23,6 +23,7 @@ from langchain_core.messages import (
     SystemMessage,
     HumanMessage,
     AIMessage,
+    AIMessageChunk,
     ToolMessage,
 )
 
@@ -37,6 +38,15 @@ try:
     from agent.tools import middleware
 except ImportError:
     middleware = None
+
+
+# ============================================================
+# 面向用户的兜底文案
+# 原则：终端用户只看到可理解的提示，异常原文（含上游 API 报错、栈信息）
+# 一律只写日志，不回吐到对话里，避免泄露内部实现与服务端细节。
+# ============================================================
+MODEL_ERROR_REPLY = "抱歉，模型服务暂时不可用，请稍后重试。若持续失败请联系管理员。"
+MAX_ITER_REPLY = "已达到最大工具调用次数，信息仍不足，无法完成回答。请尝试换一种方式提问。"
 
 
 class ReactAgent:
@@ -97,18 +107,23 @@ class ReactAgent:
         """将会话（模式 + 完整历史）全量写回 SQLite"""
         self.store.save_conversation(conversation_id, session["mode"], session["history"])
 
-    def _get_mode(self, user_id: str) -> str:
+    def get_mode(self, conversation_id: int) -> str:
         """
-        获取用户当前模式（报告模式由中间件按用户管理）。
-        中间件可用时以其为权威来源，否则默认普通模式。
-        """
-        if middleware:
-            return middleware.get_context(user_id).get("mode", "normal")
-        return "normal"
+        获取指定会话的当前模式（"normal" | "report"）。
 
-    def _get_system_prompt(self, user_id: str) -> str:
-        """根据用户当前模式返回对应系统提示词"""
-        if self._get_mode(user_id) == "report":
+        会话状态 session["mode"] 是模式的**唯一权威来源**，并随会话一起持久化到
+        conversations.mode，进程重启后可从 SQLite 原样恢复。
+
+        此前这里读的是中间件按 user_id 维护的进程内存上下文，会带来两个问题：
+        1. 进程重启后内存上下文丢失，历史里的报告会话被套上普通客服提示词；
+        2. 同一用户开两个会话时按 user_id 共享状态，会互相干扰。
+        中间件不再参与模式决策，仅作镜像同步（见 _switch_to_report_mode）。
+        """
+        return self._init_session(conversation_id)["mode"]
+
+    def _get_system_prompt(self, conversation_id: int) -> str:
+        """根据会话当前模式返回对应系统提示词"""
+        if self.get_mode(conversation_id) == "report":
             return self.report_prompt
         return self.main_prompt
 
@@ -147,8 +162,12 @@ class ReactAgent:
             result = tool.invoke(args)
             return str(result)
         except Exception as e:
-            logger.error(f"[ReactAgent] 工具 {name} 执行失败: {e}")
-            return f"工具 {name} 执行异常: {e}"
+            # 异常原文只进日志（含堆栈），交给模型的是可行动的重试指引
+            logger.exception(f"[ReactAgent] 工具 {name} 执行失败: {e}")
+            return (
+                f"工具 {name} 执行失败（内部错误已记录日志）。"
+                f"请勿重复调用该工具，可尝试其他工具或直接基于已有信息回答。"
+            )
 
     # ============================================================
     # 核心：ReAct 对话循环
@@ -187,22 +206,23 @@ class ReactAgent:
         model_with_tools = self.model.bind_tools(tools)
 
         logger.info(
-            f"[ReactAgent] 用户 {user_id} 发起对话 | 模式: {self._get_mode(user_id)} "
+            f"[ReactAgent] 用户 {user_id} 发起对话 | 会话: {conversation_id} "
+            f"| 模式: {self.get_mode(conversation_id)} "
             f"| 消息: {user_message[:50]}"
         )
 
         # ReAct 循环：最多 max_iterations 轮工具调用
         for iteration in range(self.max_iterations):
             # 每轮重新组装消息：系统提示词（可能因模式切换而变化）+ 历史
-            system_msg = SystemMessage(content=self._get_system_prompt(user_id))
+            system_msg = SystemMessage(content=self._get_system_prompt(conversation_id))
             messages = [system_msg] + session["history"]
 
             # 调用模型
             try:
                 response = model_with_tools.invoke(messages)
             except Exception as e:
-                logger.error(f"[ReactAgent] 模型调用失败: {e}")
-                return f"抱歉，模型服务暂时不可用：{e}"
+                logger.exception(f"[ReactAgent] 模型调用失败: {e}")
+                return MODEL_ERROR_REPLY
 
             session["history"].append(response)
             self._persist_session(conversation_id, session)
@@ -243,11 +263,19 @@ class ReactAgent:
                 f"[ReactAgent] 用户 {user_id} 对话完成 | 迭代 {iteration + 1} 轮 "
                 f"| 回答长度: {len(answer)}"
             )
+            # 报告已产出：自动退出报告模式，否则用户后续的普通提问
+            # （如"怎么保养"）会一直被当成报告场景，这是此前"退不出报告模式"的根因
+            if session["mode"] == "report":
+                self.finish_report(user_id, conversation_id)
             return answer
 
         # 达到最大迭代次数仍未得出最终答案
         logger.warning(f"[ReactAgent] 用户 {user_id} 达到最大迭代次数 {self.max_iterations}")
-        return "已达到最大工具调用次数，信息仍不足，无法完成回答。请尝试换一种方式提问。"
+        # 报告流程没跑完也要复位模式：模式现已持久化到 conversations.mode，
+        # 若不复位，该会话会永久停在报告提示词下，重启进程也清不掉
+        if session["mode"] == "report":
+            self.finish_report(user_id, conversation_id)
+        return MAX_ITER_REPLY
 
     # ============================================================
     # 流式对话：ReAct 循环 + 最终回答逐块产出
@@ -285,33 +313,42 @@ class ReactAgent:
         model_with_tools = self.model.bind_tools(tools)
 
         logger.info(
-            f"[ReactAgent] 用户 {user_id} 发起流式对话 | 模式: {self._get_mode(user_id)} "
+            f"[ReactAgent] 用户 {user_id} 发起流式对话 | 会话: {conversation_id} "
+            f"| 模式: {self.get_mode(conversation_id)} "
             f"| 消息: {user_message[:50]}"
         )
 
         # ReAct 循环：最多 max_iterations 轮工具调用
         for iteration in range(self.max_iterations):
             # 每轮重新组装消息：系统提示词（可能因模式切换而变化）+ 历史
-            system_msg = SystemMessage(content=self._get_system_prompt(user_id))
+            system_msg = SystemMessage(content=self._get_system_prompt(conversation_id))
             messages = [system_msg] + session["history"]
 
-            # 流式消费模型输出：文本增量实时 yield，工具调用按 chunk 累积
+            # 流式消费模型输出：文本增量实时 yield，
+            # 同时把所有 chunk 累加成完整消息后再解析工具调用。
+            # 注意：langchain 的 chunk.tool_calls 只是部分快照（中间分块 name/args 不完整），
+            # 直接取最新会得到 name=''、args={}，因此必须累加 chunk 到 Flow 末尾再取 tool_calls。
             collected_content = []
-            tool_calls = []
+            accum: AIMessageChunk | None = None
             try:
                 for chunk in model_with_tools.stream(messages):
                     if chunk.content:
                         text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
                         collected_content.append(text)
                         yield {"type": "text", "content": text}
-                    # langchain-core >= 0.3 的 chunk.tool_calls 为累积快照，取最新即可
-                    if chunk.tool_calls:
-                        tool_calls = chunk.tool_calls
+                    accum = chunk if accum is None else accum + chunk
             except Exception as e:
-                logger.error(f"[ReactAgent] 流式模型调用失败: {e}")
-                yield {"type": "text", "content": f"抱歉，模型服务暂时不可用：{e}"}
+                # 异常原文只进日志（含堆栈），用户侧只看到可理解的提示
+                logger.exception(f"[ReactAgent] 流式模型调用失败: {e}")
+                if collected_content:
+                    # 已经吐了一部分文本，补一句中断说明，避免用户以为回答完整
+                    yield {"type": "text", "content": "\n\n（以上回答因服务异常中断，请重试）"}
+                else:
+                    yield {"type": "text", "content": MODEL_ERROR_REPLY}
                 return
 
+            # 累加完整后解析工具调用（若存在）
+            tool_calls = accum.tool_calls if accum is not None else []
             full_content = "".join(collected_content)
 
             # 重建完整 AIMessage 并写入历史（与 chat() 语义一致）
@@ -366,13 +403,19 @@ class ReactAgent:
                 f"[ReactAgent] 用户 {user_id} 流式对话完成 | 迭代 {iteration + 1} 轮 "
                 f"| 回答长度: {len(full_content)}"
             )
+            # 与 chat() 一致：报告已产出即退出报告模式
+            if session["mode"] == "report":
+                self.finish_report(user_id, conversation_id)
             return
 
         # 达到最大迭代次数仍未得出最终答案
         logger.warning(f"[ReactAgent] 用户 {user_id} 达到最大迭代次数 {self.max_iterations}")
+        # 与 chat() 一致：报告流程没跑完也要复位模式，避免会话永久停在报告提示词下
+        if session["mode"] == "report":
+            self.finish_report(user_id, conversation_id)
         yield {
             "type": "text",
-            "content": "已达到最大工具调用次数，信息仍不足，无法完成回答。请尝试换一种方式提问。",
+            "content": MAX_ITER_REPLY,
         }
 
     # ============================================================
@@ -381,25 +424,36 @@ class ReactAgent:
 
     def _switch_to_report_mode(self, user_id: str, conversation_id: int):
         """
-        将会话切换到报告模式。
-        优先通过中间件注入上下文（HTTP 或本地函数），同时更新会话状态。
+        把指定会话切换到报告模式。
+
+        会话状态 session["mode"] 是模式的**唯一权威来源**：先写会话并落盘，
+        提示词切换只依赖它。中间件上下文仅作镜像同步（供其对外 /context/get
+        接口与外部集成观察），不参与任何模式决策——进程重启后它丢失也不影响行为。
         """
         session = self._init_session(conversation_id)
         session["mode"] = "report"
         self._persist_session(conversation_id, session)
 
+        # 镜像同步：写失败不影响模式，会话状态已落盘
         if middleware:
             middleware.fill_context(user_id)
-        elif self.middleware_url:
-            # middleware_url 已通过工具的 HTTP 调用触发，这里仅记录
-            pass
 
-        logger.info(f"[ReactAgent] 用户 {user_id} 已切换到报告模式，后续使用报告提示词")
+        logger.info(
+            f"[ReactAgent] 会话 {conversation_id}（用户 {user_id}）已切换到报告模式，"
+            f"后续使用报告提示词"
+        )
 
     def finish_report(self, user_id: str = "unknown", conversation_id: int = None):
         """
-        报告生成完成后调用：恢复普通模式，清理中间件上下文。
-        建议在 agent 输出报告后由外部调用。
+        退出报告模式：把会话状态恢复为普通模式，并清理中间件中该用户的上下文。
+
+        调用时机：
+        - 自动：chat() / chat_stream() 产出一轮的最终回答后，若该会话仍处于
+          report 模式，则由内部自动调用——报告已经给出，后续提问应回到普通
+          客服模式，否则用户会永久停留在报告提示词下；
+        - 手动：前端「退出报告模式」按钮，或调用方在自定义流程结束后自行调用。
+
+        与 _switch_to_report_mode 对称：会话状态是权威源，中间件仅作镜像清理。
         """
         if conversation_id is not None:
             session = self._init_session(conversation_id)

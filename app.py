@@ -17,6 +17,7 @@ from datetime import datetime
 from agent.react_agent import ReactAgent
 from agent.tools import middleware
 from agent.tools.session_store import SessionStore
+from utils.logger_handler import logger
 
 # 会话持久化存储（SQLite）：历史会话列表、消息恢复都从这读取
 session_store = SessionStore()
@@ -60,14 +61,41 @@ def get_agent(middleware_url: str) -> ReactAgent:
     return ReactAgent(middleware_url=middleware_url)
 
 
+# ============================================================
+# 知识库预热：把「写入向量库」挪出用户请求路径
+# ============================================================
+# 入库是写 Chroma 的操作，而 Chroma 是单进程嵌入式向量库，读写并发会让
+# hnsw 索引读取失败（Error creating hnsw segment reader: Nothing found on disk）。
+# 因此把首次全量入库放在应用启动阶段完成（st.cache_resource 保证同进程仅执行一次），
+# 用户提问时只读向量库。预热失败不阻断页面，提问时仍会走懒加载兜底。
+@st.cache_resource
+def warm_up_knowledge_base() -> bool:
+    try:
+        from rag.rag_service import RagSummarizeService
+        RagSummarizeService()
+        logger.info("[app] 知识库预热完成")
+        return True
+    except Exception as e:
+        logger.error(f"[app] 知识库预热失败，改为首次提问时懒加载：{e}", exc_info=True)
+        return False
+
+
+with st.spinner("正在加载知识库..."):
+    warm_up_knowledge_base()
+
+
 def start_new_conversation(user_id: str):
     """
     开始新会话（空状态）：
     1. 归档该用户所有进行中的会话（含上次未归档的）
     2. 新建一个 active 会话作为当前会话
+       （新会话记录默认 mode='normal'；模式按 conversation_id 隔离，
+        报告模式不会被带到新会话）
+    3. 同步清理中间件上下文镜像（模式权威源是会话状态，这里只是保持镜像一致）
     """
     session_store.archive_all_active(user_id)
     conv_id = session_store.create_conversation(user_id)
+    middleware.clear_context(user_id)
     st.session_state.current_conv_id = conv_id
     st.session_state.messages = []
     st.session_state.current_conv_user = user_id
@@ -104,14 +132,47 @@ with st.sidebar:
 
     st.divider()
 
-    # 当前模式指示器（从中间件读取真实状态）
-    current_mode = middleware.get_context(user_id).get("mode", "normal")
+    # 当前模式指示器（读会话自身状态）
+    # session["mode"] 是模式的唯一权威源，按 conversation_id 存储并持久化在
+    # conversations.mode；不再读中间件按 user_id 维护的进程内存上下文，
+    # 否则进程重启后指示器会与真实状态脱节，同一用户多会话也会互相干扰。
+    _cid = st.session_state.get("current_conv_id")
+    # 切换用户时 current_conv_id 仍指向上一个用户的会话，此时按即将新建的普通会话展示
+    _conv = (
+        session_store.get_conversation(_cid)
+        if _cid and st.session_state.get("current_conv_user") == user_id
+        else None
+    )
+    current_mode = _conv["mode"] if _conv else "normal"
     if current_mode == "report":
         st.markdown("### 📊 当前：报告模式")
         st.caption("已注入报告上下文，使用报告提示词")
+        # 手动退出通道：报告已输出后 agent 会自动退出，这里用于中途反悔的情况
+        if st.button("↩️ 退出报告模式", use_container_width=True):
+            get_agent(middleware_url).finish_report(user_id, _cid)
+            st.rerun()
     else:
         st.markdown("### 💬 当前：普通模式")
         st.caption("标准客服对话模式")
+
+    # 状态自检（调试用）：把「权威模式」与「中间件镜像」并排show出来。
+    # 会话模式（按 conversation_id，落盘在 conversations.mode）是唯一权威源，
+    # 决定下一轮用哪套提示词；中间件上下文（按 user_id，存进程内存）只是镜像，
+    # 进程重启或切换历史会话后可能与权威源不一致——有分歧时以权威模式为准。
+    with st.expander("🔍 状态自检（调试）", expanded=False):
+        _mirror = middleware.get_context(user_id).get("mode", "normal")
+        if _conv:
+            _auth = _conv["mode"]
+            st.markdown(f"- 会话 ID：`{_conv['id']}`（{_conv['status']}）")
+            st.markdown(f"- 权威模式（会话，conversations.mode）：`{_auth}` ← 决定本轮提示词")
+            st.markdown(f"- 中间件镜像（user_id，进程内存）：`{_mirror}`")
+            if _auth != _mirror:
+                st.warning("两源不一致：以权威模式为准，镜像已过期（进程重启后就会出现这种情况）")
+            else:
+                st.caption("两源一致")
+            st.caption("提示词应为：报告 prompt" if _auth == "report" else "提示词应为：普通客服 prompt")
+        else:
+            st.caption("尚无当前会话，进入对话后显示")
 
     st.divider()
 
@@ -139,6 +200,8 @@ with st.sidebar:
                     cur = st.session_state.get("current_conv_id")
                     if cur and cur != conv["id"]:
                         session_store.archive_conversation(cur)
+                    # 上一个会话已结束，其报告模式不应带到这条历史会话中
+                    middleware.clear_context(user_id)
                     # 目标记录转 active：加载全部对话，可继续对话
                     session_store.reactivate_conversation(conv["id"])
                     st.session_state.current_conv_id = conv["id"]
@@ -230,7 +293,10 @@ if prompt := st.chat_input("请输入您的问题，例如：生成我的使用�
         "content": response,
         "tool_calls": tool_calls,
     })
-    # 输入提交后 Streamlit 会自动 rerun，以更新侧边栏模式指示器等状态
+    # 本轮结束后立即 rerun：侧边栏的代码先于主区域执行，而本轮的结束动作
+    # （报告模式自动复位、模式落盘）发生在侧边栏渲染之后。不 rerun 的话，
+    # 模式指示器会慢一轮才更新，看起来像"卡在报告模式"。
+    st.rerun()
 
 
 # ============================================================

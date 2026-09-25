@@ -3,8 +3,14 @@
 
 职责：
 1. 接收 agent 中 fill_context_for_report 工具的调用，为指定用户注入报告生成上下文
-2. 管理用户会话状态（普通模式 / 报告模式），为 agent 提示词切换提供依据
-3. 提供上下文查询、清理接口
+2. 提供上下文查询、清理接口（供外部集成观察当前状态）
+3. 对外暴露 HTTP 接口（POST /context/fill、GET /context/get、POST /context/clear）
+
+⚠️ 模式归属说明：
+    模式的**权威来源是会话状态**（ReactAgent.sessions 的 "mode" →
+    持久化为 conversations.mode，按 conversation_id 隔离）。本模块的
+    _context_store 只是按 user_id 维护的进程内存镜像，agent 写入它仅为兼容
+    对外接口，**不参与提示词切换决策**；进程重启后它丢失也不影响 agent 行为。
 
 接口：
   POST /context/fill   body: {"user_id": "1001"}  -> 注入报告上下文
@@ -65,7 +71,7 @@ def fill_context(user_id: str, extra: dict = None) -> dict:
 
 def get_context(user_id: str) -> dict:
     """
-    获取用户当前上下文。
+    获取用户当前上下文（进程内存镜像，非模式权威来源）。
     若用户无上下文，返回默认普通模式。
 
     Returns:
@@ -95,7 +101,7 @@ def clear_context(user_id: str) -> bool:
 
 
 def is_report_mode(user_id: str) -> bool:
-    """快捷判断用户是否处于报告模式"""
+    """快捷判断镜像上下文中该用户是否为报告模式（仅反映最近一次 fill/clear，非权威来源）"""
     return get_context(user_id).get("mode") == "report"
 
 

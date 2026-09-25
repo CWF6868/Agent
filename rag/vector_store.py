@@ -31,6 +31,15 @@ class VectorStoreService:
     def get_retriever(self):
         return self.vector_store.as_retriever(search_kwargs={"k": chroma_conf["k"]})
 
+    def _add_documents_in_batches(self, documents: list, batch_size: int = 10):
+        """把文档按 batch_size 分批写入向量库，规避 embedding 服务单次条数上限。
+
+        阿里云 text-embedding 接口单次上限为 20 条，超过会返回
+        400 InvalidParameter: batch size is invalid，因此这里留出余量取 10。
+        """
+        for i in range(0, len(documents), batch_size):
+            self.vector_store.add_documents(documents[i : i + batch_size])
+
     def load_document(self):
         """
         从数据文件夹内读取数据文件，转为向量存入向量库
@@ -94,8 +103,8 @@ class VectorStoreService:
                     logger.warning(f"[加载知识库]{path}分片后没有有效文本内容，跳过")
                     continue
 
-                # 将内容存入向量库
-                self.vector_store.add_documents(split_document)
+                
+                self._add_documents_in_batches(split_document)
 
                 # 记录这个已经处理好的文件的md5，避免下次重复加载
                 save_md5_hex(md5_hex)

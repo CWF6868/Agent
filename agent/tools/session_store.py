@@ -17,6 +17,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
@@ -118,13 +119,39 @@ class SessionStore:
     # ---------- 基础连接 ----------
 
     def _connect(self):
-        conn = sqlite3.connect(self.db_path)
+        """创建连接并应用并发相关设置。
+
+        - WAL：读不阻塞写、写不阻塞读，多会话并发时不再互相顶掉
+        - busy_timeout：遇到锁时等待而非立刻抛 database is locked
+        - synchronous=NORMAL：WAL 模式下的推荐档位，兼顾安全与写入速度
+        """
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
+
+    @contextmanager
+    def _connection(self):
+        """连接作用域：正常退出提交、异常回滚、无论如何都关闭连接。
+
+        原先直接 `with self._connect() as conn` 只负责提交/回滚事务，
+        连接本身要等 GC 回收；显式 close 避免文件句柄在长跑进程中堆积。
+        """
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_db(self):
         """建表 + 旧版数据迁移（幂等）"""
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.executescript(_SCHEMA)
             self._migrate_legacy(conn)
             conn.commit()
@@ -183,7 +210,7 @@ class SessionStore:
     def create_conversation(self, user_id: str) -> int:
         """新建 active 会话，返回会话 ID"""
         now = _now()
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             cur = conn.execute(
                 "INSERT INTO conversations(user_id, title, mode, status, created_at, updated_at) "
                 "VALUES(?,?,?,?,?,?)",
@@ -195,7 +222,7 @@ class SessionStore:
     def archive_all_active(self, user_id: str) -> int:
         """将某用户所有 active 会话归档（打开网站/新对话时调用），返回处理数量。
         空会话（无消息）直接删除，避免历史列表出现无意义记录。"""
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             rows = conn.execute(
                 "SELECT id FROM conversations WHERE user_id=? AND status='active'",
                 (user_id,),
@@ -207,7 +234,7 @@ class SessionStore:
 
     def archive_conversation(self, conv_id: int):
         """归档单个会话（点击新对话时调用）；空会话直接删除"""
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             self._archive_row(conn, conv_id)
             conn.commit()
 
@@ -227,7 +254,7 @@ class SessionStore:
 
     def reactivate_conversation(self, conv_id: int):
         """将归档会话转回 active（从历史列表选中继续对话时调用）"""
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 "UPDATE conversations SET status='active', updated_at=? WHERE id=?",
                 (_now(), conv_id),
@@ -236,14 +263,14 @@ class SessionStore:
 
     def delete_conversation(self, conv_id: int):
         """删除会话及其全部消息"""
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("DELETE FROM conv_messages WHERE conversation_id=?", (conv_id,))
             conn.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
             conn.commit()
 
     def clear_user(self, user_id: str):
         """删除某用户的全部会话（含消息）"""
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 "DELETE FROM conv_messages WHERE conversation_id IN "
                 "(SELECT id FROM conversations WHERE user_id=?)",
@@ -256,7 +283,7 @@ class SessionStore:
 
     def get_conversation(self, conv_id: int) -> dict:
         """恢复单个会话（含完整历史）；不存在时返回 None"""
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             row = conn.execute(
                 "SELECT * FROM conversations WHERE id=?", (conv_id,)
             ).fetchone()
@@ -279,7 +306,7 @@ class SessionStore:
 
     def save_conversation(self, conv_id: int, mode: str, history: list) -> None:
         """全量写回会话（消息先清后插；首次对话时自动生成标题）"""
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             row = conn.execute(
                 "SELECT user_id, title FROM conversations WHERE id=?", (conv_id,)
             ).fetchone()
@@ -303,7 +330,7 @@ class SessionStore:
 
     def list_archived(self, user_id: str) -> list[dict]:
         """返回某用户的历史（archived）会话，按更新时间倒序"""
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             rows = conn.execute(
                 "SELECT c.id, c.title, c.created_at, c.updated_at, "
                 "COUNT(m.id) AS message_count "
