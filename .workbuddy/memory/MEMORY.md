@@ -207,7 +207,10 @@ append `ToolMessage`，恢复时不清洗 → 中断即留下缺配对 tool 响�
 **requirements.txt**（**2026-09-25 已修**）：补 `dashscope==1.27.3`（`model/factory.py:36` 用的
 `langchain_community.embeddings.DashScopeEmbeddings` 运行时必需），并把全部 `>=` 改为
 **实测版本 `==`**（Python 3.11 跑通的组合记录在文件头注释）；
-**`eval_questions.py` 源码丢失（只剩 .pyc）** —— 仍未处理。
+**`eval_questions.py` 源码丢失** —— 2026-09-25 **已重写恢复**。反编译在 Python 3.11 上不可行
+（uncompyle6/decompyle3 上限 3.8，直接拒绝），改按 pyc 反汇编挖出的契约重写，输出与旧产物
+逐字段一致；验证脚本 `_verify_eval.py` 22/22，真实冒烟 Q1/Q21/Q25 三条链路通过。
+默认写 `data/eval_sessions.db`，**不再污染生产库**；重跑时按 ID 保留 CSV 的人工标注列。
 
 ### 已核实为误报 / 已修（2026-09-25 二轮）
 - 首次 RAG 阻塞 28 秒：**已修**，预热挪到 app 启动。但代价是"挪走"不是"消除"——冷启动页面
