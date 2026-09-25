@@ -13,10 +13,10 @@
 | 🧠 **ReAct 思考循环** | 思考 → 调用工具 → 观察结果 → 再思考 → 最终回答，最多迭代 5 轮 |
 | 📚 **RAG 知识增强** | Chroma 向量库 + DashScope Embedding，检索扫地机器人专业资料后再回答 |
 | 🛠️ **7 个可调用工具** | 知识检索、天气查询、用户身份、月份获取、外部数据、报告上下文注入等 |
-| 📊 **双提示词模式** | 普通客服模式 / 报告写手模式，由中间件按用户动态切换 |
+| 📊 **双提示词模式** | 普通客服模式 / 报告写手模式，按 `conversation_id` 由会话状态切换（中间件仅作镜像，供其对外接口展示） |
 | 💬 **多会话持久化** | SQLite 存储，支持新建 / 归档 / 恢复 / 删除历史会话 |
 | ⚡ **流式输出** | 模型回答逐字渲染，工具调用过程可折叠查看 |
-| 🚀 **惰性加载优化** | 模型、向量库、RAG 服务全部延迟初始化，避免页面加载阻塞 |
+| 🚀 **启动预热 + 惰性兜底** | 知识库在启动阶段预热（仅首次启动需等待约 15~40 秒），模型等其余组件首次使用时才初始化 |
 | 🔌 **中间件双模式** | 支持「本地函数模式」（同进程）与「HTTP 服务模式」（独立部署） |
 
 ---
@@ -99,7 +99,7 @@ Agent/
 ├── test_session_persist.py     # 会话持久化验证（不依赖模型/RAG）
 ├── test_react_integration.py   # ReactAgent 集成验证（假模型）
 ├── test_app_history.py         # Streamlit AppTest 交互流程验证
-├── md5.txt                     # 知识库文件 MD5 去重记录（运行时自动生成）
+├── md5.txt                     # 知识库同步标记（运行时自动生成、按实际结果重写，非权威数据源）
 │
 ├── agent/                      # Agent 核心
 │   ├── react_agent.py          # ReAct 主体：思考循环 / 流式输出 / 模式切换
@@ -113,13 +113,13 @@ Agent/
 │
 ├── rag/                        # 检索增强
 │   ├── rag_service.py          # RAG 总结服务（检索 + 拼上下文 + 模型总结）
-│   └── vector_store.py         # 向量库服务（Chroma + 切分 + MD5 去重增量入库）
+│   └── vector_store.py         # 向量库服务（Chroma + 切分 + 按文件 MD5 增量同步）
 │
 ├── utils/                      # 通用工具
 │   ├── config_handler.py       # 统一加载 4 个 yml 配置
 │   ├── path_tool.py            # 项目绝对路径解析
 │   ├── file_handler.py         # MD5 计算 / 文件列举 / PDF·TXT 加载器
-│   ├── logger_handler.py       # 日志器（控制台 + 按日切分文件）
+│   ├── logger_handler.py       # 日志器（控制台 + 文件按日切分，单文件 5MB 轮转、保留 5 份）
 │   └── prompt_loader.py        # 提示词加载
 │
 ├── prompts/                    # 提示词模板
@@ -206,10 +206,21 @@ export DASHSCOPE_API_KEY="sk-xxxxxxxx"
 python rag/vector_store.py
 ```
 
-程序会遍历 `data/` 下所有允许类型的文件，按 MD5 去重后切分入库。重复执行不会重复写入。
+程序会遍历 `data/` 下所有允许类型的文件（后缀大小写不敏感），按文件 MD5 判断该做什么：
+
+| 情况 | 行为 |
+| --- | --- |
+| 新增文件 | 切分入库 |
+| 文件内容变了 | **先删除该文件的旧分片，再入库新分片**，不会留下过期内容 |
+| 文件从 `data/` 删除 | 其分片与 MD5 记录一并清除 |
+
+重复执行是幂等的：内容没变的文件直接跳过，不会重复写入。
 
 > 调整切分参数请编辑 `config/chroma.yml` 的 `chunk_size` / `chunk_overlap` / `separators`。
-> 若需重新入库，删除 `md5.txt` 与 `chroma_db/` 后重跑即可。
+> 若需完全重建，建议**同时**删除 `md5.txt` 与 `chroma_db/` 后重跑。
+> 只删其中一个也不会静默失效：`md5.txt` 只是"该文件已同步"的加速标记、不是权威数据源，
+> 程序每次同步都会校验它与向量库是否一致、并按本次实际结果重写它
+> （只删 `chroma_db/` → 检测到库内无分片 → 重新入库；只删 `md5.txt` → 记录为空 → 全量重新入库）。
 
 ### 5. 启动应用
 
@@ -322,8 +333,8 @@ collection_name: agent                          # 向量库集合名
 persist_directory: chroma_db                    # 持久化目录
 k: 3                                            # 检索返回条数
 data_path: data                                 # 知识文档目录
-md5_hex_store: md5.txt                          # MD5 去重记录文件
-allow_knowledge_file_type: ["txt", "pdf"]       # 允许的文件类型
+md5_hex_store: md5.txt                          # 知识库同步标记（非权威，按实际结果重写）
+allow_knowledge_file_type: [".txt", ".pdf"]     # 允许的文件类型（带不带点、大小写均可）
 chunk_size: 200                                 # 分片长度
 chunk_overlap: 20                               # 分片重叠
 separators: ["\n\n", "。", ".", "?", "？", "!", " ", ""]
@@ -355,14 +366,18 @@ report_prompt_path: prompts/report_prompt.txt       # 报告写手提示词
 
 ### 报告模式切换机制
 
-报告生成不是硬编码的分支逻辑，而是由 **模型自主判断 + 中间件状态管理** 协同完成：
+报告生成不是硬编码的分支逻辑，而是由 **模型自主判断 + 会话状态管理** 协同完成：
 
 1. 提示词中强约束：判断用户意图为「生成报告」时，必须先调用 `fill_context_for_report`；
-2. `ReactAgent` 检测到该工具名被调用 → 调用中间件 `fill_context(user_id)`，用户模式置为 `report`；
-3. 下一轮循环组装消息时，`_get_system_prompt()` 读取模式并返回 **报告写手提示词**；
-4. 报告生成完毕可调用 `agent.finish_report(user_id, conversation_id)` 恢复普通模式。
+2. `ReactAgent` 检测到该工具名被调用 → `_switch_to_report_mode()` 把该会话的
+   `session["mode"]` 置为 `report`（按 `conversation_id` 隔离）并落盘到 `conversations.mode`；
+3. 下一轮循环组装消息时，`_get_system_prompt()` 按 `conversation_id` 读取模式并返回 **报告写手提示词**；
+4. 报告产出后自动调用 `finish_report()` 恢复普通模式（`max_iterations` 用尽的收尾分支同样会复位，
+   因此报告轮被中断也不会把模式留在 `report`）。
 
-这种设计把「模式状态」外置到中间件，Agent 本身保持无状态倾向，便于横向扩展与独立部署。
+**模式状态的唯一权威来源是会话状态 `session["mode"]`**（持久化为 `conversations.mode`）。
+中间件 `fill_context()` 仍会被调用，但只作按 `user_id` 的进程内存镜像、供其对外 HTTP 接口展示，
+**不参与提示词切换决策**——否则进程重启后报告会话会读到过期镜像、用错提示词。
 
 ### 多会话模型
 
@@ -380,15 +395,18 @@ report_prompt_path: prompts/report_prompt.txt       # 报告写手提示词
 空会话（无任何消息）在归档时直接删除，避免历史列表堆积无意义记录。
 旧版单会话表（`sessions` / `messages`）在首次初始化时自动迁移为归档会话并删除旧表。
 
-### 惰性加载
+### 加载策略：启动预热 + 惰性兜底
 
-实测数据：`langchain_chroma` 导入约 **12 秒**，RAG 服务初始化约 **28 秒**，`langchain_openai` 导入约 **7.5 秒**，ChatModel 创建约 **3-4 秒**。
+实测（热盘）：`import rag.vector_store`（连带 chromadb 等）约 **8.7 秒**，RAG 服务的客户端与 embedding 构造约 **5.7 秒**，合计约 **15 秒**；冷盘首次可达 **40 秒**。`langchain_openai` 导入约 **7.5 秒**，ChatModel 创建约 **3-4 秒**。
 
-若在模块 import 阶段完成这些初始化，网页首屏会长时间白屏。因此项目中：
+**为什么知识库入库放在启动阶段**：Chroma 是单进程嵌入式向量库，写入与检索不能并发——一边 `add_documents` 一边 `retriever.invoke()` 会抛
+`Error creating hnsw segment reader: Nothing found on disk`。因此把「写」收敛到启动时一次做完，运行期只「读」。对应到代码：
 
+- `app.py` —— 启动时用 `@st.cache_resource` 执行一次 `warm_up_knowledge_base()` 完成入库与预热。
+  **首次启动页面会停留约 15~40 秒**（界面有明确提示），之后每次 rerun 命中缓存瞬时返回；
+  预热失败只记录日志并降级为「首次提问时懒加载」，不阻断页面
 - `model/factory.py` —— `get_chat_model()` / `get_embed_model()` 首次调用时才创建
-- `agent/tools/agents_tools.py` —— RAG 服务在首次调用 `rag_summarize` 时才延迟 import 并初始化
-- `app.py` —— 用 `@st.cache_resource` 缓存 `ReactAgent` 实例，避免每次 rerun 重建
+- `agent/tools/agents_tools.py` —— RAG 服务仍是延迟 import + 双检锁单例，作为预热失败时的兜底路径
 
 ---
 
@@ -398,15 +416,17 @@ report_prompt_path: prompts/report_prompt.txt       # 报告写手提示词
 
 ```csv
 "用户ID","特征","清洁效率","耗材","对比","时间"
-"1001","养猫","95.2%","边刷轻微磨损","较上月提升3%","2025-01"
+"1001","65㎡公寓 | 单身 | 木地板","覆盖率:85%\n日均清扫:45㎡\n漏扫区域:沙发底部（高度不足）","主刷寿命:剩余60天\nHEPA滤网:剩余40%","优于65%同面积用户（清洁频率更高）","2025-01"
 ```
+
+> 字段内可用**字面 `\n`** 表示换行（写入提示词时保留为多行文本），字段本身不包含半角逗号。
 
 ---
 
 ## ⚠️ 注意事项
 
 1. **API Key 安全**：密钥一律通过环境变量注入，不要写入配置文件。项目根目录的 `.env`（由 `.env.example` 复制而来）会在启动时自动加载，**已存在的系统环境变量优先、不会被覆盖**；同理，运行时以 `config/rag.yml` 为基线，若存在 `config/rag.local.yml` 则会覆盖同名字段，本地真实端点写在那里面即可（已被 `.gitignore` 忽略，仓库中仅保留 `config/rag.yml.example` 模板）。
-2. **知识库自动入库**：RAG 服务首次初始化时会自动把 `data/` 下的新增或已修改知识文件补进向量库（按文件 MD5 去重，已入库的文件直接跳过），**无需再手动执行** `python rag/vector_store.py`；该命令仍可用于单独预构建知识库、提前排除解析问题。
+2. **知识库增量同步**：应用启动（RAG 服务首次初始化）时会自动把 `data/` 下**新增 / 已修改 / 已删除**的知识文件同步进向量库——新增与修改的入库（修改的会先删掉旧分片，不会留下过期内容）、删除的清掉分片与 MD5 记录，**无需再手动执行** `python rag/vector_store.py`；该命令仍可用于单独预构建知识库、提前排除解析问题。同步按文件 MD5 判断，重复执行幂等。
 3. **天气工具**：依赖 `wttr.in` 公网服务，网络不通时返回兜底文案，不影响主流程。降雨概率取自该接口未来 6 小时的真实预报值，取不到时该段描述会被整体省略，不会用固定文案代替。
 4. **外部数据热更新**：`data/external/records.csv` 按文件 `mtime` 判断是否需要重新加载，修改 CSV 后**无需重启进程**，下次调用自动生效。
 5. **会话缓存**：`ReactAgent` 内存中的 `sessions` 与 SQLite 双写，进程重启后从 SQLite 恢复完整历史。会话库启用了 WAL 模式，多会话并发读写不会互相阻塞。

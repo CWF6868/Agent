@@ -160,7 +160,8 @@ def get_weather(city: str) -> str:
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
-        current = data["current_condition"][0]
+        # current_condition 同样用 `or [{}]` 兜底，避免整个键缺失时直接 IndexError
+        current = (data.get("current_condition") or [{}])[0]
         # 优先取中文描述，兜底取英文。
         # 注意：必须用 `or [{}]` 而不是 `get(key, [{}])`——get 的默认值只在 key 缺失时
         # 生效，key 存在但值为空列表时 [0] 会抛 IndexError，导致整条天气降级为
@@ -171,12 +172,20 @@ def get_weather(city: str) -> str:
             or (current.get("weatherDesc") or [{}])[0].get("value")
             or "未知"
         )
-        result = (
-            f"城市{city}天气为{weather_desc}，"
-            f"气温{current['temp_C']}摄氏度，"
-            f"空气湿度{current['humidity']}%，"
-            f"{current['winddir16Point']}风{current['windspeedKmph']}公里/小时"
-        )
+
+        # 各项按需拼接：任一字段缺失只影响它自己那一段，不会让整条天气退化成
+        # "暂时无法获取"（原实现用 current['temp_C'] 直取，缺一个键就 KeyError 全盘降级）
+        parts = [f"城市{city}天气为{weather_desc}"]
+        if current.get("temp_C"):
+            parts.append(f"气温{current['temp_C']}摄氏度")
+        if current.get("humidity"):
+            parts.append(f"空气湿度{current['humidity']}%")
+        wind_dir = current.get("winddir16Point")
+        wind_speed = current.get("windspeedKmph")
+        if wind_dir and wind_speed:
+            parts.append(f"{wind_dir}风{wind_speed}公里/小时")
+        result = "，".join(parts)
+
         # 降雨概率为真实预报值；取不到时整段省略，不编造
         rain_desc = _next_6h_rain_desc(data)
         if rain_desc:

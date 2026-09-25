@@ -15,6 +15,7 @@ import os
 
 import yaml
 
+from utils.logger_handler import logger
 from utils.path_tool import get_abs_path
 
 try:
@@ -29,6 +30,29 @@ if load_dotenv is not None and os.path.exists(_ENV_PATH):
     load_dotenv(_ENV_PATH, override=False)
 
 
+def _read_yaml(path: str, encoding: str = "utf-8") -> dict:
+    """读取 YAML 配置；内容为空（或不是键值对）时返回 {} 并明确告警。
+
+    直接把 yaml.load 的结果返回出去，空配置会得到 None，报错点会推迟到
+    `chroma_conf["collection_name"]` 这类下标访问上，离根因（配置被清空）很远。
+    这里统一兜底并记一条指名的 error，方便一眼定位到是哪个文件坏了。
+
+    注意：文件缺失（FileNotFoundError）不兜底——那属于部署错误，应当直接暴露。
+    """
+    with open(path, "r", encoding=encoding) as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+
+    if not isinstance(conf, dict):
+        logger.error(
+            f"[配置加载]{path} 内容为空或不是键值对"
+            f"（yaml 解析结果为 {type(conf).__name__}），已按空配置处理，"
+            "请检查该文件是否被误清空"
+        )
+        return {}
+
+    return conf
+
+
 def load_rag_config(encoding: str="utf-8"):
     """
     加载模型相关配置：以 config/rag.yml 为基线，若存在 config/rag.local.yml
@@ -38,32 +62,25 @@ def load_rag_config(encoding: str="utf-8"):
     README 的配置步骤即按此约定撰写。此前只读 rag.yml，导致按文档创建的
     rag.local.yml 从未生效，端点只能落到空值、模型名也只能用仓库里的占位值。
     """
-    def _read(path: str) -> dict:
-        with open(path, "r", encoding=encoding) as f:
-            return yaml.load(f, Loader=yaml.FullLoader) or {}
-
-    conf = _read(get_abs_path("config/rag.yml"))
+    conf = _read_yaml(get_abs_path("config/rag.yml"), encoding)
 
     local_path = get_abs_path("config/rag.local.yml")
     if os.path.exists(local_path):
-        conf.update(_read(local_path))
+        conf.update(_read_yaml(local_path, encoding))
 
     return conf
 
 
 def load_chroma_config(config_path: str=get_abs_path("config/chroma.yml"), encoding: str="utf-8"):
-    with open(config_path, "r", encoding=encoding) as f:
-        return yaml.load(f, Loader=yaml.FullLoader)
+    return _read_yaml(config_path, encoding)
 
 
 def load_prompts_config(config_path: str=get_abs_path("config/prompts.yml"), encoding: str="utf-8"):
-    with open(config_path, "r", encoding=encoding) as f:
-        return yaml.load(f, Loader=yaml.FullLoader)
+    return _read_yaml(config_path, encoding)
 
 
 def load_agent_config(config_path: str=get_abs_path("config/agent.yml"), encoding: str="utf-8"):
-    with open(config_path, "r", encoding=encoding) as f:
-        return yaml.load(f, Loader=yaml.FullLoader)
+    return _read_yaml(config_path, encoding)
 
 
 rag_conf = load_rag_config()

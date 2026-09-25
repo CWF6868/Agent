@@ -3,7 +3,8 @@ persist_directory : chroma_db
 k :  3
 data_path : data
 md5_hex_store : md5.txt
-allow_knowledge_file_type : ["txt","pdf"]
+# 允许入库的知识文件后缀。带不带点、大小写都不影响（代码会统一成 ".txt" 形式比较）。
+allow_knowledge_file_type : [".txt",".pdf"]
 
 chunk_size : 200
 chunk_overlap : 20

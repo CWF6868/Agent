@@ -122,6 +122,34 @@ D 真实库只读体检），报告 `_p3_report.json`。
 5. 诊断顺序：`md5.txt` 行数 ↔ `embedding_metadata` 按 source 分组计数 ↔ `max_seq_id`
    ↔ `collection.count()` ↔ k=40 检索召回分布。以上全健康 ⇒ 问题在运行时，不在数据。
 
+## 知识库同步的权威设计（2026-09-25 重写 vector_store 后确立）
+
+`VectorStoreService.load_document()` 现在做的是**按文件 source 的增量同步**，三种情况都处理：
+新增入库 / 内容变更先删旧分片再入库 / 文件删除则连分片与 MD5 记录一起清掉。
+
+必须记住的四条：
+
+1. **`source` 是绝对路径**，由 `PyPDFLoader` / `TextLoader` 写入 metadata。
+   `vector_store.delete(where={"source": path})` 在 langchain_chroma 1.1.0 上可用
+   （`Chroma.delete(ids=None, **kwargs)` 会把 kwargs 透传给 `_collection.delete`）；
+   `vector_store.get(where=..., include=[])` 只取 ids。**别用 `endswith` 猜来源。**
+2. **先删旧分片、后写新分片**，这个顺序是有意的：中途失败时 MD5 不会被记录，
+   下次启动会重进同一分支把残留的半成品分片一起清掉，自行收敛。
+   反过来（先写后删）失败会留下重复分片。
+3. **`md5.txt` 只是"已同步"的加速标记，不是权威数据源**。同步结束会**整体重写**它
+   （不是追加）。追加会让旧版本摘要永久留下，用户把文件改回旧版本时会被误判为"已入库"而跳过。
+   判"是否需要入库"的条件是 `md5 在记录里` **且** `source 在库内`，因此
+   "只删 chroma_db" / "只删 md5.txt" / "改回旧版本" 三种情况都能自愈。
+4. **清理已删文件时，只能清「不在磁盘清单里」的 source**（`sources_in_store - allowed_set`）。
+   清单内但本次没处理成功的（例如 MD5 计算失败）必须保留，否则会误删有效数据。
+
+反模式（已修，别再写回去）：`if f.endswith(allowed_types)` —— `["txt","pdf"]` 无点号时
+`a.TXT` 被漏（Windows 大小写不敏感，用户以为入库了）、无点号文件 `c_pdf` 被误收。
+正确做法是 `os.path.splitext(f)[1].lower() in {".txt",".pdf"}` 且加 `isfile` 排除同名目录。
+
+验证脚本：`_verify_readme_fixes.py`（38 项，用确定性假 embedding 跑真实 Chroma，
+不调 API；向量库/数据/MD5 全部指向 `.workbuddy/_tmp_readme_fix/`，不碰生产库）。
+
 ## 工具健壮性 / 常见反模式（2026-09-25）
 
 ### `dict.get(key, default)[0]` 是陷阱（get_weather 已踩）
@@ -138,6 +166,35 @@ D 真实库只读体检），报告 `_p3_report.json`。
 - 同类写法全局排查：`middleware.py:156` `params.get("user_id", [None])[0]` 是**同款但不会触发**
   （`parse_qs` 对存在的 key 永远至少给一个值，实测 `?user_id=` 直接被丢弃 → key 缺失 → 走默认值），
   故未改动。
+
+### 2026-09-25 第三轮只读审计（发现项的处理状态）
+
+**~~P1：`rag/vector_store.py` 只 add 不 delete~~（2026-09-25 已修 → 见下方"知识库同步"）**
+原问题：知识文件改动后旧分片残留、仍被 k=3 召回（README 承诺的"已修改文件补进库"实为"只追加"）。
+
+**~~P2 数据/正确性（前四条已修）~~**
+- ~~md5.txt 与 chroma_db 不同步会让向量库被整体误判为空~~ → 已改为**每次同步校验两者一致性**，
+  且 md5.txt 降级为"加速标记、非权威源"，同步结束按实际结果重写 → 只删任一都能自愈
+- ~~`get_file_md5_hex` 返回 None 未校验~~ → 调用方显式判 None：跳过该文件、不写记录、不动库内分片
+- ~~后缀过滤大小写敏感 + `allowed_types` 无点号~~ → 统一为「取扩展名 + 转小写」比较，
+  `["txt","pdf"]` / `[".txt",".pdf"]` / `[".TXT"]` 三种写法等价（注意：不能用 `str.endswith`
+  判断，无点的 `*_pdf` 会被误收；另需 `isfile` 排除同名目录）
+- ~~`get_weather` 四个核心字段用 `[]` 直取~~ → 改为逐段按需拼接，缺哪个只略哪段，不整条降级
+- ~~三个 `load_*_config` 对空文件无 `or {}` 兜底~~ → 收口到 `_read_yaml()`，空值返回 `{}` + 指名 error
+- 仍未修：外部 CSV 用 `split(",")` 解析（字段含逗号即错位，当前数据不触发）
+
+**仍未修的 P2/P3**（等用户下令）
+P2 并发：`factory` 的两个模型单例无锁；`generate_external_data` 的全局 dict 无锁
+（`clear()` 期间可被并发读到空）。
+P2 契约：main_prompt 的"5 次工具调用"与 `max_iterations=5`（实为**轮次**）口径不一致；
+`retriever_docs` 的 `except Exception` 过宽（鉴权/限流也走重建重试）。
+前端：多标签页/多用户并存会产生 **2 条 active**（`archive_all_active` 全局归档 +
+`append_messages` 无条件写回 `status='active'`）；user_id 可被清空且无校验；
+切换中间件模式会新建 agent 实例使会话内存缓存分裂（上下文静默丢失）；
+流式对话异常无兜底（助手消息丢失 + 红页）。
+复现脚本：`_audit_probe.py`（全部跑在临时目录 / 临时 SQLite，不碰生产数据）。
+已核实**不是** bug：`append_messages` 对已删除会话返回 0 不产生孤儿消息；
+`_archive_row` 会删空会话；两个 `SessionStore` 实例锁不共享但 WAL 保证隔离。
 
 ## 尚未完成的技术债（2026-09-25 审计结论，详见根目录《代码审计与优化建议.md》）
 
