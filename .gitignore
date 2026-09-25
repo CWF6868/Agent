@@ -48,6 +48,15 @@ logs/
 data/sessions.db
 *.db
 *.sqlite3
+# SQLite WAL 模式的旁路文件（会随写入频繁变动，且可能含未落盘的对话数据）
+*.db-wal
+*.db-shm
+*.sqlite3-wal
+*.sqlite3-shm
+
+# 清理/回滚用的数据库快照与临时工作目录（含用户对话数据，禁止提交）
+.workbuddy/backups/
+.workbuddy/_*
 
 # 知识库 MD5 去重记录（随知识库重建生成）
 md5.txt

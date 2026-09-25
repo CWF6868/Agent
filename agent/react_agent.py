@@ -224,11 +224,18 @@ class ReactAgent:
                 logger.exception(f"[ReactAgent] 模型调用失败: {e}")
                 return MODEL_ERROR_REPLY
 
-            session["history"].append(response)
-            self._persist_session(conversation_id, session)
-
             # ---- 情况1：模型发起了工具调用 ----
             if response.tool_calls:
+                # 先把本轮全部工具执行完并收集配对响应，最后把「AI 消息 + 它的全部
+                # 工具响应」一次性追加并落盘。
+                #
+                # 为什么不边执行边落盘：AI 消息一次声明了 N 个 tool_call，若在只写完
+                # 其中一部分时就中断（进程崩溃 / Streamlit Stop / 强杀），磁盘上会留下
+                # "声明了工具调用却没有配对 tool 响应"的历史，恢复后每次调模型都返回
+                # 400 且持续复现，该会话彻底不可用。
+                # 工具执行期间历史末尾仍是用户消息，所以任何时刻落盘都是自洽的
+                #（`_switch_to_report_mode` 此刻落盘的也是合法历史）。
+                tool_msgs = []
                 for tool_call in response.tool_calls:
                     tool_name = tool_call.get("name", "")
                     logger.info(
@@ -246,16 +253,23 @@ class ReactAgent:
                         f"[ReactAgent] 工具 {tool_name} 返回: {observation[:100]}"
                     )
 
-                    # 将观察结果加入对话历史
-                    tool_msg = ToolMessage(
-                        content=observation,
-                        tool_call_id=tool_call["id"],
+                    # 暂存观察结果，待全部执行完毕后再与 AI 消息一起写入历史
+                    tool_msgs.append(
+                        ToolMessage(
+                            content=observation,
+                            tool_call_id=tool_call["id"],
+                        )
                     )
-                    session["history"].append(tool_msg)
-                    self._persist_session(conversation_id, session)
+
+                session["history"].append(response)
+                session["history"].extend(tool_msgs)
+                self._persist_session(conversation_id, session)
 
                 # 继续下一轮思考（模型根据观察结果决定继续调用工具或给出答案）
                 continue
+
+            session["history"].append(response)
+            self._persist_session(conversation_id, session)
 
             # ---- 情况2：模型直接给出最终回答（无工具调用） ----
             answer = response.content or ""
@@ -357,11 +371,14 @@ class ReactAgent:
                 if tool_calls
                 else AIMessage(content=full_content)
             )
-            session["history"].append(response)
-            self._persist_session(conversation_id, session)
 
             # ---- 情况1：模型发起了工具调用 ----
             if tool_calls:
+                # 与 chat() 一致：先执行完全部工具并收集配对响应，再把「AI 消息 +
+                # 它的全部工具响应」一次性落盘，保证任何落盘点上的历史都自洽。
+                # 若边执行边落盘，中途中断会留下"声明了 tool_calls 却缺配对响应"
+                # 的历史，恢复后调模型持续 400（详见 session_store.sanitize_history）。
+                tool_msgs = []
                 executed = []
                 for tool_call in tool_calls:
                     tool_name = tool_call.get("name", "")
@@ -380,23 +397,29 @@ class ReactAgent:
                         f"[ReactAgent] 工具 {tool_name} 返回: {observation[:100]}"
                     )
 
-                    # 将观察结果加入对话历史
-                    tool_msg = ToolMessage(
-                        content=observation,
-                        tool_call_id=tool_call["id"],
+                    # 暂存观察结果，待全部执行完毕后再与 AI 消息一起写入历史
+                    tool_msgs.append(
+                        ToolMessage(
+                            content=observation,
+                            tool_call_id=tool_call["id"],
+                        )
                     )
-                    session["history"].append(tool_msg)
-                    self._persist_session(conversation_id, session)
-
                     executed.append({
                         "name": tool_name,
                         "args": tool_call.get("args", {}),
                         "result": observation,
                     })
 
+                session["history"].append(response)
+                session["history"].extend(tool_msgs)
+                self._persist_session(conversation_id, session)
+
                 # 通知前端展示本轮工具调用，继续下一轮思考
                 yield {"type": "tool_call", "tool_calls": executed}
                 continue
+
+            session["history"].append(response)
+            self._persist_session(conversation_id, session)
 
             # ---- 情况2：模型直接给出最终回答（文本已流式产出完毕） ----
             logger.info(

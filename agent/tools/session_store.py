@@ -95,6 +95,77 @@ def _row_to_msg(row: dict):
     return HumanMessage(content=row["content"])
 
 
+def _tc_id(tool_call: dict) -> str:
+    """统一取 tool_call 的 id（缺失时归一为空串，便于做集合比较）"""
+    return tool_call.get("id") or ""
+
+
+def sanitize_history(history: list) -> list:
+    """
+    清洗恢复出来的历史，保证消息序列对模型 API 合法（幂等，不修改入参）。
+
+    为什么需要它：落盘时 `AIMessage(tool_calls=...)` 与其配对的 `ToolMessage`
+    分两次写入，进程若在两次写入之间中断（崩溃 / Streamlit 被 Stop / 强杀），
+    磁盘上就会留下"声明了 N 个工具调用、却没有对应 tool 响应"的历史。
+    这种历史原样发给模型会持续返回 400（assistant 消息声明的每个 tool_call
+    都必须紧跟一条同 tool_call_id 的 tool 响应），而且**每次重试都会复现**，
+    用户侧表现为该会话再也问不出任何回答。
+
+    清洗规则：
+    1. `AIMessage` 声明的 tool_call，若其后找不到配对的 tool 响应 → 从声明中剔除；
+    2. 剔除后既无 tool_call 又无正文 → 整条丢弃（避免产生空 assistant 消息）；
+    3. 找不到前置声明的"孤儿" tool 消息 → 丢弃（否则同样触发 400）。
+
+    返回清洗后的新列表。
+    """
+    cleaned: list = []
+    total = len(history)
+    i = 0
+    while i < total:
+        msg = history[i]
+        kind = getattr(msg, "type", "")
+
+        # 孤儿 tool 消息：没有前置 AIMessage 声明（或声明已被剔除）→ 丢弃
+        if kind == "tool":
+            i += 1
+            continue
+
+        tool_calls = list(getattr(msg, "tool_calls", None) or []) if kind == "ai" else []
+        if not tool_calls:
+            cleaned.append(msg)
+            i += 1
+            continue
+
+        # 收集紧随其后的连续 tool 响应
+        j = i + 1
+        followers = []
+        while j < total and getattr(history[j], "type", "") == "tool":
+            followers.append(history[j])
+            j += 1
+
+        answered = {getattr(m, "tool_call_id", "") or "" for m in followers}
+        paired = [tc for tc in tool_calls if _tc_id(tc) in answered]
+
+        if not paired:
+            # 全部调用都没有响应：正文有内容则退化为纯文本 assistant 消息，否则整条丢弃
+            if str(msg.content or "").strip():
+                cleaned.append(AIMessage(content=msg.content))
+        elif len(paired) == len(tool_calls):
+            # 全部配对成功：原样保留
+            cleaned.append(msg)
+            cleaned.extend(followers)
+        else:
+            # 部分配对成功（多工具调用执行到一半被打断）
+            cleaned.append(AIMessage(content=msg.content, tool_calls=paired))
+            paired_ids = {_tc_id(tc) for tc in paired}
+            cleaned.extend(
+                m for m in followers if (getattr(m, "tool_call_id", "") or "") in paired_ids
+            )
+        i = j
+
+    return cleaned
+
+
 class SessionStore:
     """
     线程安全的 SQLite 多会话存储。
@@ -301,7 +372,9 @@ class SessionStore:
             "status": row["status"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
-            "history": [_row_to_msg(r) for r in rows],
+            # 恢复时统一清洗：历史上可能残留"声明了 tool_calls 却缺配对响应"的
+            # 记录（写入途中断所致），不清洗会让该会话之后每次调用模型都 400
+            "history": sanitize_history([_row_to_msg(r) for r in rows]),
         }
 
     def save_conversation(self, conv_id: int, mode: str, history: list) -> None:
