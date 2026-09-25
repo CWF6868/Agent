@@ -174,7 +174,7 @@ class SessionStore:
         store = SessionStore()
         conv_id = store.create_conversation("1001")        # 新建 active 会话
         store.save_conversation(conv_id, "normal", history) # 全量写回消息
-        store.archive_all_active("1001")                   # 打开网站时归档未完成会话
+        store.archive_all_active()                         # 打开网站时归档未完成会话（全部用户）
         store.list_archived("1001")                        # 历史会话列表
         ui = store.build_ui_messages(conv_id)              # 页面展示数据
     """
@@ -290,14 +290,27 @@ class SessionStore:
             conn.commit()
             return cur.lastrowid
 
-    def archive_all_active(self, user_id: str) -> int:
-        """将某用户所有 active 会话归档（打开网站/新对话时调用），返回处理数量。
-        空会话（无消息）直接删除，避免历史列表出现无意义记录。"""
+    def archive_all_active(self, user_id: str | None = None) -> int:
+        """归档 active 会话（打开网站/切换用户/新建会话时调用），返回处理数量。
+        空会话（无消息）直接删除，避免历史列表出现无意义记录。
+
+        user_id 为 None 时归档**全部用户**的 active 会话，这是 app 的默认调用方式。
+        原因：active 只代表"当前正在对话的那一条"，而历史列表只查 archived
+        （list_archived），因此任何被遗弃的 active —— 例如 A 用户切到 B 用户后，
+        A 的会话仍是 active 且属主已不在当前筛选范围内 —— 都会变成既不出现在
+        历史列表、也不会被清理的孤儿会话，其对话内容永久不可见。
+        全局收起可维持"同一时刻至多一条 active"这一不变量，从根上消除孤儿。
+        """
         with self._lock, self._connection() as conn:
-            rows = conn.execute(
-                "SELECT id FROM conversations WHERE user_id=? AND status='active'",
-                (user_id,),
-            ).fetchall()
+            if user_id is None:
+                rows = conn.execute(
+                    "SELECT id FROM conversations WHERE status='active'"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id FROM conversations WHERE user_id=? AND status='active'",
+                    (user_id,),
+                ).fetchall()
             for r in rows:
                 self._archive_row(conn, r["id"])
             conn.commit()

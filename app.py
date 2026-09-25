@@ -87,13 +87,17 @@ with st.spinner("正在加载知识库..."):
 def start_new_conversation(user_id: str):
     """
     开始新会话（空状态）：
-    1. 归档该用户所有进行中的会话（含上次未归档的）
+    1. 归档**所有**进行中的会话（含其它用户遗留的），再新建当前用户的空会话。
+       这里刻意不按 user_id 过滤：active 只代表"当前正在对话的那一条"，
+       而历史列表只显示 archived，所以被遗弃的 active（切换用户、
+       浏览器中途关闭）会变成既看不见也清不掉的孤儿会话。全局收起后，
+       "同一时刻至多一条 active" 成为不变量。
     2. 新建一个 active 会话作为当前会话
        （新会话记录默认 mode='normal'；模式按 conversation_id 隔离，
         报告模式不会被带到新会话）
     3. 同步清理中间件上下文镜像（模式权威源是会话状态，这里只是保持镜像一致）
     """
-    session_store.archive_all_active(user_id)
+    session_store.archive_all_active()
     conv_id = session_store.create_conversation(user_id)
     middleware.clear_context(user_id)
     st.session_state.current_conv_id = conv_id
