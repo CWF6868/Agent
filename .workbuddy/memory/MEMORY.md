@@ -124,10 +124,15 @@ D 真实库只读体检），报告 `_p3_report.json`。
 
 ## 知识库同步的权威设计（2026-09-25 重写 vector_store 后确立）
 
-`VectorStoreService.load_document()` 现在做的是**按文件 source 的增量同步**，三种情况都处理：
-新增入库 / 内容变更先删旧分片再入库 / 文件删除则连分片与 MD5 记录一起清掉。
+`VectorStoreService.load_document()` 现在做的是**按文件 source 的增量同步**，四种情况都处理：
+新增入库 / 内容变更先删旧分片再入库 / 文件删除则连分片与 MD5 记录一起清掉 /
+文件还在但新版本解析不出可入库内容（被清空·只剩空白·编码损坏）**同样清掉旧分片**。
 
-必须记住的四条：
+> **不变量：向量库里任何 source 的分片，必须对应磁盘上该文件的当前内容。**
+> "文件在、内容不可入库"允许的状态是"没有分片"，**绝不是"留着上一版分片"**。
+> 后三种情况症状完全相同——库里继续提供过期内容，回答引用已失效的知识。
+
+必须记住的五条：
 
 1. **`source` 是绝对路径**，由 `PyPDFLoader` / `TextLoader` 写入 metadata。
    `vector_store.delete(where={"source": path})` 在 langchain_chroma 1.1.0 上可用
@@ -142,13 +147,22 @@ D 真实库只读体检），报告 `_p3_report.json`。
    "只删 chroma_db" / "只删 md5.txt" / "改回旧版本" 三种情况都能自愈。
 4. **清理已删文件时，只能清「不在磁盘清单里」的 source**（`sources_in_store - allowed_set`）。
    清单内但本次没处理成功的（例如 MD5 计算失败）必须保留，否则会误删有效数据。
+5. **"内容不可入库"也要清旧分片**（`_drop_stale_chunks`，计入 `stats["cleared"]`）。
+   三条触发路径都是"文件读得到（MD5 已算出）、但新版本没内容可入库"：
+   `not documents`、`not split_document`、加载器抛异常。三条都是**确定性**的内容问题，
+   不是瞬时故障——真正的瞬时故障（文件被独占锁定 / 权限不足）会在 MD5 计算阶段就
+   返回 None 并 `skipped`，那条路径**必须保留旧分片**（别把这条也改成删）。
+   清掉后**不写 MD5 记录**：下次启动重新评估，文件修好后 MD5 变化 → 自动重新入库；
+   一直没修则每次启动留一条 warning（这是想要的提醒，不是噪音）。
 
 反模式（已修，别再写回去）：`if f.endswith(allowed_types)` —— `["txt","pdf"]` 无点号时
 `a.TXT` 被漏（Windows 大小写不敏感，用户以为入库了）、无点号文件 `c_pdf` 被误收。
 正确做法是 `os.path.splitext(f)[1].lower() in {".txt",".pdf"}` 且加 `isfile` 排除同名目录。
 
-验证脚本：`_verify_readme_fixes.py`（38 项，用确定性假 embedding 跑真实 Chroma，
+验证脚本：`_verify_readme_fixes.py`（45 项，用确定性假 embedding 跑真实 Chroma，
 不调 API；向量库/数据/MD5 全部指向 `.workbuddy/_tmp_readme_fix/`，不碰生产库）。
+关键断言是 **E3「改完文件后旧关键词检索不到」** 与 **K 段三例**（清空/全空白/编码损坏后
+旧分片不再被召回）——只看 `count()` 变化不足以证明旧分片真被删（替换+新增可能抵消）。
 
 ## 工具健壮性 / 常见反模式（2026-09-25）
 

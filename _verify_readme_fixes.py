@@ -12,6 +12,8 @@
   H. 只删 md5.txt → 全量重建且不产生重复分片
   I. 三个 yaml 加载器对空文件返回 {}（不再返回 None 把报错推到远处）
   J. get_weather 字段缺失时不再整条降级为"暂时无法获取"
+  K. 文件仍在但内容不可入库（清空 / 全空白 / 编码损坏）时，旧分片同样被清除
+     —— 与 E 同属「文件改动后旧向量不清理」，是同一症状的另一条触发路径
 
 不触碰任何生产数据：向量库/数据目录/MD5 记录全部指向 .workbuddy/_tmp_readme_fix/，
 embedding 用确定性假实现（不发网络请求），会调用模型的部分全部打桩。
@@ -313,6 +315,52 @@ def main():
     finally:
         urllib.request.urlopen = real_urlopen
         at._weather_cache.clear()
+
+    # ============================================================
+    # K. 文件仍在磁盘上、但内容已不可入库 → 旧分片同样必须清除
+    #
+    # 与 E 是同一个症状（"文件改动后旧向量不清理"）的不同触发路径：
+    # 文件被清空 / 只剩空白 / 变成非法编码导致解析器抛错。此前这三条分支只
+    # 跳过、不删旧分片，库里会继续提供上一版内容。
+    # ============================================================
+    def assert_cleared(fname, new_content, label, keyword):
+        """写入新内容后同步，断言该文件的旧分片已从库里清除。"""
+        path = os.path.join(data_dir, fname)
+        open(path, "w", encoding="utf-8").write(
+            "{} 关于某项维护的说明 关键词{}。".format(label, keyword)
+        )
+        vs.load_document()
+        check(
+            "K-{}-子 变更前旧内容可检索".format(fname),
+            any(keyword in t for t in retrieve_texts(keyword)),
+            "",
+        )
+
+        if isinstance(new_content, bytes):
+            with open(path, "wb") as f:
+                f.write(new_content)
+        else:
+            open(path, "w", encoding="utf-8").write(new_content)
+
+        st = vs.load_document()
+        still = [t for t in retrieve_texts(keyword) if keyword in t]
+        check(
+            "K-{} {} 旧分片已清除且不再被检索到".format(fname, label),
+            not still and st["cleared"] >= 1,
+            "stats={} 仍命中的旧内容条数={}".format(st, len(still)),
+        )
+
+    assert_cleared("清空.txt", "", "被清空(0字节)", "翡翠海豚")
+    assert_cleared("空白.txt", "   \n\n  \t \n", "只剩空白字符", "琥珀松鼠")
+    assert_cleared("乱码.txt", b"\xff\xfe\x00\x01\x80\x81", "非法编码(解析抛错)", "靛蓝羚羊")
+
+    # 清空类文件不应污染 MD5 记录（不记录 = 下次启动重新评估，修好后自动入库）
+    lines_k = read_md5_lines()
+    check(
+        "K4 不可入库的文件不写入 MD5 记录",
+        len(lines_k) == 2,
+        lines_k,
+    )
 
     # ============================================================
     # 汇总

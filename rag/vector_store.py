@@ -111,8 +111,31 @@ class VectorStoreService:
         logger.warning(f"[加载知识库]{read_path}后缀 {ext} 没有对应加载器，跳过")
         return []
 
+    def _drop_stale_chunks(self, path: str, sources_in_store: set, stats: dict, reason: str) -> None:
+        """文件仍在磁盘上、但新版本没有可入库内容时，清掉它的旧分片。
+
+        这是"文件改动后旧向量不清理"的另一条触发路径：文件被清空、只剩空白，
+        或编码损坏导致解析器抛错。此前这里只 `continue` 跳过，旧分片留在库里继续
+        被检索到，回答仍会引用上一版内容——与"内容变更不删旧分片"是同一个症状。
+
+        只在旧分片确实在库里时才删，并计入 stats["cleared"]。刻意**不记录它的 MD5**：
+        该文件当前状态本就无内容可入库，下次启动应当重新评估（文件修好后 MD5 变化，
+        自然会被重新入库；一直没修则每次启动留一条 warning，这是想要的提醒）。
+        """
+        if path not in sources_in_store:
+            logger.warning(f"[加载知识库]{path}{reason}，本次跳过")
+            return
+
+        removed = self._delete_by_source(path)
+        sources_in_store.discard(path)
+        stats["cleared"] += 1
+        logger.warning(
+            f"[加载知识库]{path}{reason}，已清除其旧分片 {removed} 条"
+            f"（避免上一版内容继续被检索到；修复该文件后下次启动会自动重新入库）"
+        )
+
     def load_document(self) -> dict:
-        """把 data/ 下的知识文件增量同步进向量库（新增 / 修改 / 删除三种情况都处理）。
+        """把 data/ 下的知识文件增量同步进向量库（新增 / 修改 / 删除 / 内容不可入库 四种情况）。
 
         同步规则（每个文件以其绝对路径作为 source 定位）：
         - **新增**：切分入库并记录其 MD5
@@ -121,6 +144,16 @@ class VectorStoreService:
           （回答会引用已经过期的知识），且向量库随每次编辑持续膨胀。
         - **删除**：磁盘上已不存在的文件，其分片与 MD5 记录一并清除。
           此前只追加不清理，已删除的内容仍可被检索。
+        - **内容不可入库**：文件还在，但新版本解析不出任何可入库文本（被清空 / 只剩空白 /
+          编码损坏）→ 同样清掉旧分片。否则库里会一直提供上一版内容，
+          等于"修改了文件但改动不生效、旧知识继续被引用"。
+
+          注意这与「文件暂时读不到」不同：被独占锁定 / 权限不足时，MD5 根本算不出来，
+          会在更早的分支返回 None 并 skipped，那条路径**不碰**库里已有的分片
+          ——数据没坏，只是这次读不到，删了反而造成真实的数据丢失。
+
+        核心不变量：**向量库里任何一个 source 的分片，必须对应磁盘上该文件的当前内容。**
+        任何"文件在、内容不在"的状态都不允许残留旧分片。
 
         MD5 记录与向量库必须一致，否则会出现「6 个文件全被跳过 → 检索永远返回空 →
         RAG 静默失效」。这里不靠人工保证，而是每次同步都校验、都能自愈：
@@ -128,7 +161,9 @@ class VectorStoreService:
         - 只删了 md5.txt → 记录为空 → 全量重新入库（先删旧分片，不会产生重复）
         - 文件被改回旧版本 → 该 MD5 已不在重写后的记录里 → 重新入库
 
-        :return: 统计字典 {"added","updated","unchanged","removed","skipped"}
+        :return: 统计字典 {"added","updated","unchanged","removed","cleared","skipped"}
+                 removed = 磁盘上已不存在的文件数；cleared = 文件还在但内容已不可入库、
+                 旧分片被清掉的文件数；两者都计入"向量已从库中移除"。
         """
         allowed_files: list = list(
             listdir_with_allowed_type(
@@ -152,7 +187,7 @@ class VectorStoreService:
                 "本次逐文件重新入库（会先删掉各自旧分片，不会产生重复）"
             )
 
-        stats = {"added": 0, "updated": 0, "unchanged": 0, "removed": 0, "skipped": 0}
+        stats = {"added": 0, "updated": 0, "unchanged": 0, "removed": 0, "cleared": 0, "skipped": 0}
         kept_md5: set = set()
 
         for path in allowed_files:
@@ -178,16 +213,14 @@ class VectorStoreService:
                 documents: list[Document] = self._load_file_documents(path)
 
                 if not documents:
-                    logger.warning(f"[加载知识库]{path}内没有有效文本内容，跳过")
-                    stats["skipped"] += 1
+                    self._drop_stale_chunks(path, sources_in_store, stats, "解析后没有有效文本内容")
                     continue
 
                 # 把 Document 列表切分成小块
                 split_document: list[Document] = self.spliter.split_documents(documents)
 
                 if not split_document:
-                    logger.warning(f"[加载知识库]{path}分片后没有有效文本内容，跳过")
-                    stats["skipped"] += 1
+                    self._drop_stale_chunks(path, sources_in_store, stats, "分片后没有有效文本内容")
                     continue
 
                 # 先清旧分片再写新分片。顺序是有意的：
@@ -218,7 +251,11 @@ class VectorStoreService:
             except Exception as e:
                 # exc_info为True会记录详细的报错堆栈，如果为False仅记录报错信息本身
                 logger.error(f"[加载知识库]{path}加载失败：{str(e)}", exc_info=True)
-                stats["skipped"] += 1
+                # 能走到这里说明文件本身读得到（MD5 已算出），失败原因是内容/格式问题
+                # （编码损坏、PDF 结构异常），而不是"文件被锁定/权限不足"这类瞬时故障
+                # ——后者会在上面的 MD5 计算阶段就被挡下（md5 为 None），旧分片原样保留。
+                # 因此这里也该清掉旧分片，否则库里会一直提供上一版内容。
+                self._drop_stale_chunks(path, sources_in_store, stats, "解析失败")
                 continue
 
         # 清理磁盘上已删除的文件：分片与 MD5 记录一起移除。
@@ -233,7 +270,7 @@ class VectorStoreService:
 
         logger.info(
             "[加载知识库]同步完成：新增 {added} / 更新 {updated} / 未变 {unchanged} / "
-            "移除 {removed} / 跳过 {skipped}，向量库当前共 {total} 条".format(
+            "移除 {removed} / 清空 {cleared} / 跳过 {skipped}，向量库当前共 {total} 条".format(
                 total=self._count_vectors(), **stats
             )
         )
