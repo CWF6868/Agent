@@ -95,10 +95,6 @@ sequenceDiagram
 ```
 Agent/
 ├── app.py                      # Streamlit 主入口（对话界面 + 侧边栏 + 历史会话）
-├── verify_tools.py             # 工具运行状态检查脚本（4 层检查）
-├── test_session_persist.py     # 会话持久化验证（不依赖模型/RAG）
-├── test_react_integration.py   # ReactAgent 集成验证（假模型）
-├── test_app_history.py         # Streamlit AppTest 交互流程验证
 ├── md5.txt                     # 知识库同步标记（运行时自动生成、按实际结果重写，非权威数据源）
 │
 ├── agent/                      # Agent 核心
@@ -294,23 +290,27 @@ python agent/tools/middleware.py
 
 ---
 
-## 🧪 测试与自检
+## 🧪 运行状态自检
 
-```bash
-# 工具运行状态检查（语法 / 导入 / 工具调用 / 模型配置，共 4 层）
-python verify_tools.py
+项目不随仓库提供自动化测试脚本，运行时自检通过以下两个入口：
 
-# 会话持久化验证（含旧表迁移，不依赖模型与向量库）
-python test_session_persist.py
+**1. 侧边栏「🔍 状态自检（调试）」**（默认折叠）—— 并排显示
+`权威模式（conversations.mode）` 与 `中间件镜像（user_id 进程内存）`，
+不一致时给出 warning。这是页面上唯一能直接看到「模式双源」差异的地方。
 
-# ReactAgent 集成验证（使用假模型，不消耗 API 额度）
-python test_react_integration.py
+**2. 运行日志** `logs/agent_YYYYMMDD.log` —— 按天生成，单文件 5MB 轮转、保留 5 份。
+工具调用、检索命中、模型请求与异常堆栈都记录在这里。
 
-# Streamlit 交互流程验证（空状态 / 历史加载 / 新对话）
-python test_app_history.py
+**判断知识库同步是否正常**：启动日志里每轮
+
+```
+[加载知识库]同步完成：新增 X / 更新 X / 未变 X / 移除 X / 清空 X / 跳过 X，向量库当前共 N 条
 ```
 
-所有脚本均以退出码表示结果（`0` 通过 / `1` 失败），可直接接入 CI。
+正常情况是 `未变 = 知识文件数`、`向量库当前共 N 条 > 0`。
+若检索持续返回空、而日志里 6 个文件全部计入「未变」，说明
+`md5.txt` 与 `chroma_db/` 被只删了其中一个 —— **两者必须同删或同留**，
+只删向量库会让全部文件被误判为「已入库」而跳过，RAG 静默失效。
 
 ---
 

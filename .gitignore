@@ -88,3 +88,27 @@ Thumbs.db
 # Streamlit
 # ============================================================
 .streamlit/secrets.toml
+
+# ============================================================
+# 内部工作记忆与审计产物（不随仓库公开，本地保留）
+# ============================================================
+
+# 工作记忆：含本机绝对路径、内部排查过程与已知问题清单
+.workbuddy/memory/
+
+# 内部审计报告（逐条列出本项目已知问题）
+代码审计与优化建议.md
+上传GitHub前检查清单.md
+
+# 审计探针与其报告
+_audit_probe.py
+_audit_probe_report.json
+_p*_report.json
+
+# 一次性验证脚本及其报告（已从仓库移除；删除前的副本见 .workbuddy/backups/tests_pre_delete_*/）
+_verify_*
+
+# 评测输出（可由 eval_questions.py 重新生成）
+eval_report.html
+eval_results.json
+eval_summary.csv
